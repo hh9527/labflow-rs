@@ -60,6 +60,7 @@ depends-on = ["system-active", "_ready.researcher", "query-request"]
 goal = "goal.md"
 assets = ["answer.md"]
 check = ["answer.md"]
+permissions = ["read", "edit"]
 ```
 
 artifact 的角色始终是后缀，例如 `answer.researcher`。Host 可以通过 publish

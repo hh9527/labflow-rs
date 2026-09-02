@@ -213,6 +213,16 @@ check = ["answer.md"]
                 .join(".labflow/artifacts/answer.researcher")
                 .is_file()
     });
+    let agents = fs::read_dir(directory.path().join(".opencode/agents"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(agents.len(), 1);
+    let agent_name = agents[0].file_name().into_string().unwrap();
+    assert!(agent_name.starts_with("researcher."));
+    assert!(agent_name.ends_with(".md"));
+    let agent = fs::read_to_string(agents[0].path()).unwrap();
+    assert!(agent.contains(r#"permission: {"*":"deny","read":"allow"}"#));
     wait_until(Duration::from_secs(10), || {
         Connection::open(directory.path().join(".labflow/timeline.sqlite"))
             .and_then(|connection| {

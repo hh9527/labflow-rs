@@ -44,15 +44,14 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self.send_json({"id": "ses_observer"})
             else:
-                permissions = body.get("permission", [])
-                if body.get("parentID") != "ses_observer" or not any(
-                    item.get("permission") == "read" and item.get("action") == "allow"
-                    for item in permissions
-                ):
+                if body.get("parentID") != "ses_observer" or "permission" in body:
                     self.send_error(400)
                     return
                 self.send_json({"id": "ses_worker"})
         elif self.path.startswith("/session/ses_worker/message?"):
+            if not body.get("agent", "").startswith("researcher."):
+                self.send_error(400)
+                return
             with open(os.path.join(os.getcwd(), "answer.md"), "w", encoding="utf-8") as output:
                 output.write("fake answer\n")
             self.send_json({

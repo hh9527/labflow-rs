@@ -108,6 +108,8 @@ pub struct Task {
     pub retries: u8,
     pub failures: Vec<String>,
     pub request_id: u64,
+    #[serde(default)]
+    pub agent_id: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -198,6 +200,7 @@ pub enum Event {
     TaskAnswered {
         artifact: ArtifactName,
         request_id: u64,
+        agent_id: String,
         content: String,
     },
     TaskChecked {
@@ -257,6 +260,7 @@ pub enum Effect {
         role: String,
         session_id: String,
         request_id: u64,
+        agent_id: String,
         prompt: String,
     },
     CheckTask {
@@ -396,8 +400,9 @@ impl Event {
             Event::TaskAnswered {
                 artifact,
                 request_id,
+                agent_id,
                 content,
-            } => reduce_task_answered(state, artifact, request_id, &content),
+            } => reduce_task_answered(state, artifact, request_id, &agent_id, &content),
             Event::TaskChecked {
                 artifact,
                 request_id,
@@ -447,12 +452,14 @@ fn reduce_supervisor_started(state: &mut State) -> Vec<Effect> {
         }
     }
 
+    let profiles = crate::agent::profiles(&state.plan);
     let artifacts: Vec<_> = state.tasks.keys().cloned().collect();
     let mut roles_creating = BTreeSet::new();
     let mut observer_needed = false;
     for artifact in artifacts {
         let role = artifact.role().expect("tasks belong to roles").to_owned();
         let task = state.tasks.get_mut(&artifact).expect("task exists");
+        task.agent_id = profiles[&artifact].id.clone();
         if state.sessions.contains_key(&role) {
             task.status = TaskStatus::Preparing;
             effects.push(Effect::PersistTask {
@@ -785,6 +792,7 @@ fn reduce_task_prepared(
     state.sessions.get_mut(&role).expect("session exists").busy = true;
     let task = state.tasks[&artifact].clone();
     let session = state.sessions[&role].clone();
+    let agent_id = task.agent_id.clone();
     vec![
         Effect::PersistTask {
             artifact: artifact.clone(),
@@ -799,6 +807,7 @@ fn reduce_task_prepared(
             role,
             session_id: session.id.clone(),
             request_id,
+            agent_id,
             prompt,
         },
     ]
@@ -808,12 +817,13 @@ fn reduce_task_answered(
     state: &mut State,
     artifact: ArtifactName,
     request_id: u64,
+    agent_id: &str,
     content: &str,
 ) -> Vec<Effect> {
     let Some(task) = current_task(state, &artifact, request_id) else {
         return Vec::new();
     };
-    if task.status != TaskStatus::Running {
+    if task.status != TaskStatus::Running || task.agent_id != agent_id {
         return Vec::new();
     }
     let session_effect = if let Some(role) = artifact.role()
@@ -972,6 +982,7 @@ fn schedule(state: &mut State) -> Vec<Effect> {
         .map(|(name, _)| name.clone())
         .collect();
 
+    let profiles = crate::agent::profiles(&state.plan);
     let mut effects = Vec::new();
     let mut roles_creating = BTreeSet::new();
     let mut observer_needed = false;
@@ -1002,6 +1013,7 @@ fn schedule(state: &mut State) -> Vec<Effect> {
             retries: 0,
             failures: Vec::new(),
             request_id,
+            agent_id: profiles[&artifact].id.clone(),
         };
         state.tasks.insert(artifact.clone(), task.clone());
         effects.push(Effect::PersistTask {
@@ -1173,6 +1185,9 @@ mod tests {
         Event::TaskAnswered {
             artifact,
             request_id: request,
+            agent_id: state.tasks[&ArtifactName::parse("answer.researcher").unwrap()]
+                .agent_id
+                .clone(),
             content: "无法完成任务。".into(),
         }
         .reduce(&mut state);
@@ -1315,6 +1330,7 @@ depends-on = ["request", "feedback?"]
                 retries: 0,
                 failures: vec![],
                 request_id: 1,
+                agent_id: "researcher.test".into(),
             },
         );
         for expected_retry in 1..=3 {
@@ -1322,6 +1338,15 @@ depends-on = ["request", "feedback?"]
             Event::TaskAnswered {
                 artifact: artifact.clone(),
                 request_id: request,
+                agent_id: "researcher.old-agent".into(),
+                content: "bad".into(),
+            }
+            .reduce(&mut state);
+            assert_eq!(state.tasks[&artifact].retries, expected_retry - 1);
+            Event::TaskAnswered {
+                artifact: artifact.clone(),
+                request_id: request,
+                agent_id: "researcher.test".into(),
                 content: "bad".into(),
             }
             .reduce(&mut state);
@@ -1332,6 +1357,7 @@ depends-on = ["request", "feedback?"]
         Event::TaskAnswered {
             artifact,
             request_id: request,
+            agent_id: "researcher.test".into(),
             content: "bad".into(),
         }
         .reduce(&mut state);
@@ -1361,6 +1387,7 @@ depends-on = ["request", "feedback?"]
                 retries: 1,
                 failures: vec!["previous".into()],
                 request_id: 7,
+                agent_id: "researcher.test".into(),
             },
         );
         let effects = Event::SupervisorStarted.reduce(&mut state);
@@ -1384,6 +1411,7 @@ depends-on = ["request", "feedback?"]
                 retries: 0,
                 failures: vec![],
                 request_id: 1,
+                agent_id: "researcher.test".into(),
             },
         );
         let stale = Event::SessionCreateFailed {

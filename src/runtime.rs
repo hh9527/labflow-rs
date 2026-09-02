@@ -173,10 +173,22 @@ pub async fn run(root: PathBuf, expected_supervisor_generation: Option<Timestamp
             match effect {
                 SupervisorControlEffect::LoadPlan { request_id } => {
                     let event = match Plan::load(&root) {
-                        Ok(plan) => SupervisorControlEvent::PlanLoaded {
-                            request_id,
-                            plan: Arc::new(plan),
-                        },
+                        Ok(plan) => {
+                            let profiles = crate::agent::profiles(&plan);
+                            match crate::agent::materialize(&root, &profiles) {
+                                Ok(()) => SupervisorControlEvent::PlanLoaded {
+                                    request_id,
+                                    plan: Arc::new(plan),
+                                },
+                                Err(error) => SupervisorControlEvent::PlanLoadFailed {
+                                    request_id,
+                                    generation: artifact_timestamp(
+                                        &ArtifactName::parse("system-plan")?.path(&root),
+                                    )?,
+                                    reason: format!("{error:#}"),
+                                },
+                            }
+                        }
                         Err(error) => SupervisorControlEvent::PlanLoadFailed {
                             request_id,
                             generation: artifact_timestamp(
@@ -519,17 +531,6 @@ impl Effect {
                 parent_session_id,
                 request_id,
             } => {
-                let permissions = context.plan.roles[&role]
-                    .permissions
-                    .iter()
-                    .map(|permission| {
-                        json!({
-                            "permission": permission,
-                            "pattern": "*",
-                            "action": "allow",
-                        })
-                    })
-                    .collect::<Vec<_>>();
                 let response = context
                     .client
                     .post(format!("{}/session", context.backend_url))
@@ -537,7 +538,6 @@ impl Effect {
                     .json(&json!({
                         "parentID": parent_session_id,
                         "title": format!("labflow:{role}"),
-                        "permission": permissions,
                     }))
                     .send()
                     .await?
@@ -580,6 +580,7 @@ impl Effect {
                 role: _,
                 session_id,
                 request_id,
+                agent_id,
                 prompt,
             } => {
                 let response = context
@@ -589,7 +590,10 @@ impl Effect {
                         context.backend_url
                     ))
                     .query(&[("directory", context.root.to_string_lossy().as_ref())])
-                    .json(&json!({ "parts": [{ "type": "text", "text": prompt }] }))
+                    .json(&json!({
+                        "agent": agent_id,
+                        "parts": [{ "type": "text", "text": prompt }]
+                    }))
                     .send()
                     .await?
                     .error_for_status()?;
@@ -607,6 +611,7 @@ impl Effect {
                     .send(Event::TaskAnswered {
                         artifact,
                         request_id,
+                        agent_id,
                         content,
                     })
                     .await

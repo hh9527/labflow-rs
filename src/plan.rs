@@ -55,6 +55,7 @@ pub struct Artifact {
     pub assets: Vec<AssetPath>,
     pub inputs: Option<Vec<AssetPath>>,
     pub check: Vec<AssetPath>,
+    pub permissions: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,6 +135,7 @@ struct RawArtifact {
     inputs: Option<Vec<String>>,
     #[serde(default)]
     check: Vec<String>,
+    permissions: Option<Vec<String>>,
 }
 
 impl Plan {
@@ -191,6 +193,8 @@ impl Plan {
                 if goal.is_none() {
                     bail!("worker artifact `{name}` must declare `goal`");
                 }
+            } else if raw_artifact.permissions.is_some() {
+                bail!("host artifact `{name}` cannot declare `permissions`");
             }
             artifacts.insert(
                 name,
@@ -200,6 +204,7 @@ impl Plan {
                     assets,
                     inputs,
                     check,
+                    permissions: raw_artifact.permissions,
                 },
             );
         }
