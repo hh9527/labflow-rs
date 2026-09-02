@@ -8,8 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use fs2::FileExt;
 use reqwest::Client;
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::plan::{AssetPath, Benchmark, Plan};
@@ -111,7 +110,7 @@ enum Effect {
     CommitRound {
         round_id: i64,
     },
-    Output(Value),
+    Output(Output),
     Fail(String),
 }
 
@@ -119,6 +118,71 @@ enum Effect {
 enum DeleteAfter {
     Commit(i64),
     Fail(String),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum Output {
+    Empty(()),
+    Round {
+        round: i64,
+    },
+    Answer {
+        #[serde(rename = "Q")]
+        q: String,
+        #[serde(rename = "K")]
+        k: String,
+        reply: String,
+    },
+    Reply {
+        reply: String,
+    },
+}
+
+#[derive(Serialize)]
+struct CreateSessionRequest<'a> {
+    title: String,
+    agent: &'a str,
+    permission: Vec<PermissionRule>,
+}
+
+#[derive(Deserialize)]
+struct CreateSessionResponse {
+    id: String,
+}
+
+#[derive(Serialize)]
+struct MessageRequest<'a> {
+    agent: &'a str,
+    parts: [TextPart<'a>; 1],
+}
+
+#[derive(Serialize)]
+struct TextPart<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+}
+
+#[derive(Deserialize)]
+struct MessageResponse {
+    #[serde(default)]
+    parts: Vec<MessagePart>,
+}
+
+#[derive(Deserialize)]
+struct MessagePart {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PermissionRule {
+    permission: String,
+    pattern: String,
+    action: &'static str,
 }
 
 impl Event {
@@ -166,7 +230,7 @@ impl Event {
                     .round
                     .as_ref()
                     .context("attached session has no round")?;
-                Ok(vec![Effect::Output(json!({ "round": round.id }))])
+                Ok(vec![Effect::Output(Output::Round { round: round.id })])
             }
             Self::Requested(Command::Next) => {
                 let round = current_round(state)?;
@@ -182,7 +246,7 @@ impl Event {
                     .iter_mut()
                     .find(|question| question.status == "pending")
                 else {
-                    return Ok(vec![Effect::Output(Value::Null)]);
+                    return Ok(vec![Effect::Output(Output::Empty(()))]);
                 };
                 question.status = "current".into();
                 let round_id = round.id;
@@ -239,9 +303,13 @@ impl Event {
                 let stored = current_question_mut(current_round(state)?)?;
                 *stored = question.clone();
                 let value = if !clarification {
-                    json!({ "Q": question.q, "K": question.k, "reply": reply })
+                    Output::Answer {
+                        q: question.q,
+                        k: question.k,
+                        reply,
+                    }
                 } else {
-                    json!({ "reply": reply })
+                    Output::Reply { reply }
                 };
                 Ok(vec![Effect::Output(value)])
             }
@@ -260,7 +328,7 @@ impl Event {
             Self::Archived => {
                 let question = current_question_mut(current_round(state)?)?;
                 question.status = "archived".into();
-                Ok(vec![Effect::Output(Value::Null)])
+                Ok(vec![Effect::Output(Output::Empty(()))])
             }
             Self::Requested(Command::Finish) => {
                 let round = current_round(state)?;
@@ -286,7 +354,7 @@ impl Event {
             Self::SessionDeleted(DeleteAfter::Fail(error)) => Ok(vec![Effect::Fail(error)]),
             Self::RoundCommitted => {
                 state.round = None;
-                Ok(vec![Effect::Output(Value::Null)])
+                Ok(vec![Effect::Output(Output::Empty(()))])
             }
         }
     }
@@ -374,19 +442,16 @@ impl Effect {
                         .client
                         .post(format!("{}/session", context.backend_url))
                         .query(&[("directory", context.root.to_string_lossy().as_ref())])
-                        .json(&json!({
-                            "title": format!("labflow:bench:{}:{round_id}", context.name),
-                            "agent": context.benchmark.respondent,
-                            "permission": respondent_permissions(&context.benchmark),
-                        }))
+                        .json(&CreateSessionRequest {
+                            title: format!("labflow:bench:{}:{round_id}", context.name),
+                            agent: &context.benchmark.respondent,
+                            permission: respondent_permissions(&context.benchmark),
+                        })
                         .send()
                         .await?
                         .error_for_status()?;
-                    let value: Value = response.json().await?;
-                    Ok(value["id"]
-                        .as_str()
-                        .context("OpenCode respondent session response has no id")?
-                        .to_owned())
+                    let response: CreateSessionResponse = response.json().await?;
+                    Ok(response.id)
                 }
                 .await;
                 Ok(Some(match result {
@@ -434,15 +499,18 @@ impl Effect {
                         context.backend_url
                     ))
                     .query(&[("directory", context.root.to_string_lossy().as_ref())])
-                    .json(&json!({
-                        "agent": context.benchmark.respondent,
-                        "parts": [{ "type": "text", "text": prompt }]
-                    }))
+                    .json(&MessageRequest {
+                        agent: &context.benchmark.respondent,
+                        parts: [TextPart {
+                            kind: "text",
+                            text: &prompt,
+                        }],
+                    })
                     .send()
                     .await?
                     .error_for_status()?;
-                let value: Value = response.json().await?;
-                let reply = response_text(&value);
+                let response: MessageResponse = response.json().await?;
+                let reply = response_text(response);
                 let mut question = question;
                 if !clarification {
                     question.clarifications = 0;
@@ -637,7 +705,7 @@ fn load_questions(context: &ContextData) -> Result<Vec<Question>> {
         .collect()
 }
 
-fn respondent_permissions(benchmark: &Benchmark) -> Vec<Value> {
+fn respondent_permissions(benchmark: &Benchmark) -> Vec<PermissionRule> {
     let mut rules = vec![
         rule("*", "*", "deny"),
         rule("glob", "*", "allow"),
@@ -664,8 +732,12 @@ fn respondent_permissions(benchmark: &Benchmark) -> Vec<Value> {
     rules
 }
 
-fn rule(permission: &str, pattern: &str, action: &str) -> Value {
-    json!({ "permission": permission, "pattern": pattern, "action": action })
+fn rule(permission: &str, pattern: &str, action: &'static str) -> PermissionRule {
+    PermissionRule {
+        permission: permission.to_owned(),
+        pattern: pattern.to_owned(),
+        action,
+    }
 }
 
 fn path_patterns(path: &AssetPath) -> Vec<String> {
@@ -677,13 +749,12 @@ fn path_patterns(path: &AssetPath) -> Vec<String> {
     }
 }
 
-fn response_text(value: &Value) -> String {
-    value["parts"]
-        .as_array()
+fn response_text(response: MessageResponse) -> String {
+    response
+        .parts
         .into_iter()
-        .flatten()
-        .filter(|part| part["type"] == "text")
-        .filter_map(|part| part["text"].as_str())
+        .filter(|part| part.kind == "text")
+        .filter_map(|part| part.text)
         .collect::<Vec<_>>()
         .join("\n")
 }
