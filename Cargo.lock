@@ -704,7 +704,7 @@ dependencies = [
  "filetime",
  "futures-util",
  "inotify",
- "libc",
+ "once_cell",
  "predicates",
  "regex",
  "reqwest",

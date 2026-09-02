@@ -132,6 +132,7 @@ check = ["answer.md"]
             directory.path().to_str().unwrap(),
             "publish",
             "system-backend",
+            "system-supervisor",
         ])
         .status()
         .unwrap();
@@ -272,6 +273,15 @@ fn host_tasks_poll_waits_for_required_decision() {
 
     databases
         .persist_host_tasks(&HostTasks {
+            tasks: Vec::new(),
+            opt: vec![ArtifactName::parse("query-feedback").unwrap()],
+        })
+        .unwrap();
+    thread::sleep(Duration::from_millis(250));
+    assert!(poll.try_wait().unwrap().is_none());
+
+    databases
+        .persist_host_tasks(&HostTasks {
             tasks: vec![ArtifactName::parse("query-request").unwrap()],
             opt: vec![ArtifactName::parse("query-feedback").unwrap()],
         })
@@ -293,6 +303,15 @@ fn invalid_plan_requests_system_plan_and_recovers() {
     fs::create_dir_all(directory.path().join(".labflow/artifacts")).unwrap();
     fs::write(directory.path().join(".labflow/config"), "port = 4096\n").unwrap();
     fs::write(directory.path().join("lab-plan.toml"), "not toml").unwrap();
+    labflow()
+        .args([
+            "--root",
+            directory.path().to_str().unwrap(),
+            "publish",
+            "system-supervisor",
+        ])
+        .status()
+        .unwrap();
     let mut supervisor = labflow()
         .args(["--root", directory.path().to_str().unwrap(), "supervisor"])
         .stdout(Stdio::null())
@@ -389,11 +408,29 @@ fn run_tracks_supervisor_artifact_lifecycle() {
     wait_until(Duration::from_secs(10), || {
         child_pids(runner_pid).is_empty()
     });
+    labflow()
+        .args([
+            "--root",
+            directory.path().to_str().unwrap(),
+            "publish",
+            "system-supervisor",
+        ])
+        .status()
+        .unwrap();
+    wait_until(Duration::from_secs(10), || {
+        !child_pids(runner_pid).is_empty()
+    });
     Command::new("kill")
         .args(["-TERM", &runner_pid.to_string()])
         .status()
         .unwrap();
     assert!(runner.wait().unwrap().success());
+    assert!(
+        !directory
+            .path()
+            .join(".labflow/artifacts/system-supervisor")
+            .exists()
+    );
 }
 
 #[cfg(target_os = "linux")]

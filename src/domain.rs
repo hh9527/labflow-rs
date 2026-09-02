@@ -15,13 +15,15 @@ pub struct State {
     pub artifacts: BTreeMap<ArtifactName, Option<Timestamp>>,
     pub virtual_artifacts: BTreeMap<ArtifactName, Timestamp>,
     pub observer_session: Option<String>,
+    pub observer_request: Option<u64>,
     pub sessions: BTreeMap<String, Session>,
     pub tasks: BTreeMap<ArtifactName, Task>,
     pub backend_generation: Option<Option<Timestamp>>,
     pub backend_ready: bool,
+    pub backend_process: ProcessStatus,
+    pub backend_process_generation: Option<Timestamp>,
     pub supervisor_generation: Option<Option<Timestamp>>,
     pub plan_generation: Option<Option<Timestamp>>,
-    pub plan_error: bool,
     pub next_request_id: u64,
     pub host_tasks: HostTasks,
 }
@@ -39,13 +41,15 @@ impl State {
             artifacts,
             virtual_artifacts: BTreeMap::new(),
             observer_session: None,
+            observer_request: None,
             sessions: BTreeMap::new(),
             tasks: BTreeMap::new(),
             backend_generation: None,
             backend_ready: false,
+            backend_process: ProcessStatus::Stopped,
+            backend_process_generation: None,
             supervisor_generation: None,
             plan_generation: None,
-            plan_error: false,
             next_request_id: 1,
             host_tasks: HostTasks::default(),
         }
@@ -90,6 +94,14 @@ pub struct Session {
     pub busy: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessStatus {
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Task {
     pub status: TaskStatus,
@@ -130,7 +142,6 @@ impl TaskAnswer {
 #[derive(Clone, Debug)]
 pub enum Event {
     SupervisorStarted,
-    PlanLoadFailed,
     ArtifactObserved {
         name: ArtifactName,
         modified: Option<Timestamp>,
@@ -138,18 +149,36 @@ pub enum Event {
     BackendReady {
         generation: Timestamp,
     },
+    BackendStarted {
+        generation: Timestamp,
+    },
+    BackendStartFailed {
+        generation: Timestamp,
+        reason: String,
+    },
+    BackendExited {
+        generation: Timestamp,
+        status: String,
+    },
+    BackendRetry {
+        generation: Timestamp,
+    },
     ObserverSessionCreated {
+        request_id: u64,
         session_id: String,
     },
     ObserverSessionCreateFailed {
+        request_id: u64,
         reason: String,
     },
     SessionCreated {
         role: String,
+        request_id: u64,
         session_id: String,
     },
     SessionCreateFailed {
         role: String,
+        request_id: u64,
         reason: String,
     },
     SessionStatusChanged {
@@ -207,7 +236,12 @@ pub enum Effect {
     PersistHostTasks {
         tasks: HostTasks,
     },
-    CreateObserverSession,
+    PersistNextRequest {
+        next: u64,
+    },
+    CreateObserverSession {
+        request_id: u64,
+    },
     CreateSession {
         role: String,
         parent_session_id: String,
@@ -233,8 +267,15 @@ pub enum Effect {
         artifact: ArtifactName,
         request_id: u64,
     },
-    SetBackend {
-        generation: Option<Timestamp>,
+    StartBackend {
+        generation: Timestamp,
+    },
+    StopBackend,
+    DelayBackendRetry {
+        generation: Timestamp,
+    },
+    Log {
+        message: String,
     },
     ReloadPlan,
     ExitSupervisor,
@@ -242,33 +283,85 @@ pub enum Effect {
 
 impl Event {
     pub fn reduce(self, state: &mut State) -> Vec<Effect> {
+        let previous_next_request = state.next_request_id;
         let mut effects = match self {
             Event::SupervisorStarted => reduce_supervisor_started(state),
-            Event::PlanLoadFailed => {
-                state.plan_error = true;
-                Vec::new()
-            }
             Event::ArtifactObserved { name, modified } => {
                 reduce_artifact_observed(state, name, modified)
             }
             Event::BackendReady { generation } => {
-                if state.backend_generation == Some(Some(generation)) {
+                if state.backend_generation == Some(Some(generation))
+                    && state.backend_process == ProcessStatus::Running
+                {
                     state.backend_ready = true;
                 }
                 Vec::new()
             }
-            Event::ObserverSessionCreated { session_id } => {
-                reduce_observer_created(state, session_id)
+            Event::BackendStarted { generation } => {
+                if state.backend_generation == Some(Some(generation))
+                    && state.backend_process == ProcessStatus::Starting
+                    && state.backend_process_generation == Some(generation)
+                {
+                    state.backend_process = ProcessStatus::Running;
+                }
+                Vec::new()
             }
-            Event::ObserverSessionCreateFailed { reason } => {
-                reduce_observer_create_failed(state, reason)
+            Event::BackendStartFailed { generation, reason } => {
+                if state.backend_process_generation != Some(generation) {
+                    Vec::new()
+                } else {
+                    state.backend_process = ProcessStatus::Stopped;
+                    state.backend_process_generation = None;
+                    let desired = state.backend_generation.flatten();
+                    if desired == Some(generation) {
+                        vec![
+                            Effect::Log {
+                                message: format!("backend start failed: {reason}"),
+                            },
+                            Effect::DelayBackendRetry { generation },
+                        ]
+                    } else if let Some(desired) = desired {
+                        state.backend_process = ProcessStatus::Starting;
+                        state.backend_process_generation = Some(desired);
+                        vec![Effect::StartBackend {
+                            generation: desired,
+                        }]
+                    } else {
+                        Vec::new()
+                    }
+                }
             }
-            Event::SessionCreated { role, session_id } => {
-                reduce_session_created(state, role, session_id)
+            Event::BackendExited { generation, status } => {
+                reduce_backend_exited(state, generation, status)
             }
-            Event::SessionCreateFailed { role, reason } => {
-                reduce_session_create_failed(state, role, reason)
+            Event::BackendRetry { generation } => {
+                if state.backend_generation == Some(Some(generation))
+                    && state.backend_process == ProcessStatus::Stopped
+                {
+                    state.backend_process = ProcessStatus::Starting;
+                    state.backend_process_generation = Some(generation);
+                    vec![Effect::StartBackend { generation }]
+                } else {
+                    Vec::new()
+                }
             }
+            Event::ObserverSessionCreated {
+                request_id,
+                session_id,
+            } => reduce_observer_created(state, request_id, session_id),
+            Event::ObserverSessionCreateFailed { request_id, reason } => {
+                reduce_observer_create_failed(state, request_id, reason)
+            }
+            Event::SessionCreated {
+                role,
+                request_id,
+                session_id,
+            } => reduce_session_created(state, role, request_id, session_id),
+            Event::SessionCreateFailed {
+                role,
+                request_id,
+                reason,
+            } => reduce_session_create_failed(state, role, request_id, reason),
             Event::SessionStatusChanged { session_id, busy } => {
                 let Some((role, session)) = state
                     .sessions
@@ -329,11 +422,20 @@ impl Event {
             state.host_tasks = host_tasks.clone();
             effects.push(Effect::PersistHostTasks { tasks: host_tasks });
         }
+        if state.next_request_id != previous_next_request {
+            effects.push(Effect::PersistNextRequest {
+                next: state.next_request_id,
+            });
+        }
         effects
     }
 }
 
 fn reduce_supervisor_started(state: &mut State) -> Vec<Effect> {
+    let supervisor = ArtifactName::parse("system-supervisor").expect("built-in name");
+    if state.timestamp(&supervisor).is_none() {
+        return vec![Effect::ExitSupervisor];
+    }
     let mut effects = Vec::new();
     for (role, session) in &mut state.sessions {
         if session.busy {
@@ -347,7 +449,7 @@ fn reduce_supervisor_started(state: &mut State) -> Vec<Effect> {
 
     let artifacts: Vec<_> = state.tasks.keys().cloned().collect();
     let mut roles_creating = BTreeSet::new();
-    let mut observer_requested = false;
+    let mut observer_needed = false;
     for artifact in artifacts {
         let role = artifact.role().expect("tasks belong to roles").to_owned();
         let task = state.tasks.get_mut(&artifact).expect("task exists");
@@ -376,16 +478,26 @@ fn reduce_supervisor_started(state: &mut State) -> Vec<Effect> {
                         request_id: task.request_id,
                     });
                 }
-            } else if !observer_requested {
-                observer_requested = true;
-                effects.push(Effect::CreateObserverSession);
+            } else {
+                observer_needed = true;
             }
         }
+    }
+    if observer_needed {
+        request_observer(state, &mut effects);
     }
     effects
 }
 
-fn reduce_observer_create_failed(state: &mut State, reason: String) -> Vec<Effect> {
+fn reduce_observer_create_failed(
+    state: &mut State,
+    request_id: u64,
+    reason: String,
+) -> Vec<Effect> {
+    if state.observer_request != Some(request_id) {
+        return Vec::new();
+    }
+    state.observer_request = None;
     let waiting: Vec<_> = state
         .tasks
         .iter()
@@ -411,16 +523,23 @@ fn reduce_observer_create_failed(state: &mut State, reason: String) -> Vec<Effec
             task: Some(task.clone()),
         });
     }
-    effects.push(Effect::CreateObserverSession);
+    request_observer(state, &mut effects);
     effects
 }
 
-fn reduce_session_create_failed(state: &mut State, role: String, reason: String) -> Vec<Effect> {
+fn reduce_session_create_failed(
+    state: &mut State,
+    role: String,
+    request_id: u64,
+    reason: String,
+) -> Vec<Effect> {
     let Some(artifact) = state
         .tasks
         .iter()
         .find(|(name, task)| {
-            name.role() == Some(role.as_str()) && task.status == TaskStatus::WaitingSession
+            name.role() == Some(role.as_str())
+                && task.status == TaskStatus::WaitingSession
+                && task.request_id == request_id
         })
         .map(|(name, _)| name.clone())
     else {
@@ -445,12 +564,16 @@ fn reduce_session_create_failed(state: &mut State, role: String, reason: String)
             request_id,
         });
     } else {
-        effects.push(Effect::CreateObserverSession);
+        request_observer(state, &mut effects);
     }
     effects
 }
 
-fn reduce_observer_created(state: &mut State, session_id: String) -> Vec<Effect> {
+fn reduce_observer_created(state: &mut State, request_id: u64, session_id: String) -> Vec<Effect> {
+    if state.observer_request != Some(request_id) {
+        return Vec::new();
+    }
+    state.observer_request = None;
     state.observer_session = Some(session_id.clone());
     let mut effects = vec![Effect::PersistObserverSession {
         session_id: session_id.clone(),
@@ -479,6 +602,15 @@ fn reduce_observer_created(state: &mut State, session_id: String) -> Vec<Effect>
     effects
 }
 
+fn request_observer(state: &mut State, effects: &mut Vec<Effect>) {
+    if state.observer_session.is_some() || state.observer_request.is_some() {
+        return;
+    }
+    let request_id = state.allocate_request();
+    state.observer_request = Some(request_id);
+    effects.push(Effect::CreateObserverSession { request_id });
+}
+
 fn reduce_artifact_observed(
     state: &mut State,
     name: ArtifactName,
@@ -494,9 +626,20 @@ fn reduce_artifact_observed(
         "system-backend" => {
             if state.backend_generation != Some(modified) {
                 state.backend_ready = false;
-                effects.push(Effect::SetBackend {
-                    generation: modified,
-                });
+                match state.backend_process {
+                    ProcessStatus::Stopped => {
+                        if let Some(generation) = modified {
+                            state.backend_process = ProcessStatus::Starting;
+                            state.backend_process_generation = Some(generation);
+                            effects.push(Effect::StartBackend { generation });
+                        }
+                    }
+                    ProcessStatus::Starting | ProcessStatus::Running => {
+                        state.backend_process = ProcessStatus::Stopping;
+                        effects.push(Effect::StopBackend);
+                    }
+                    ProcessStatus::Stopping => {}
+                }
             }
             state.backend_generation = Some(modified);
         }
@@ -509,7 +652,10 @@ fn reduce_artifact_observed(
             state.supervisor_generation = Some(modified);
         }
         "system-plan" => {
-            if state.plan_generation.is_some() && state.plan_generation != Some(modified) {
+            if modified.is_some()
+                && state.plan_generation.is_some()
+                && state.plan_generation != Some(modified)
+            {
                 effects.push(Effect::ReloadPlan);
             }
             state.plan_generation = Some(modified);
@@ -530,7 +676,54 @@ fn reduce_artifact_observed(
     effects
 }
 
-fn reduce_session_created(state: &mut State, role: String, session_id: String) -> Vec<Effect> {
+fn reduce_backend_exited(state: &mut State, generation: Timestamp, status: String) -> Vec<Effect> {
+    if state.backend_process_generation != Some(generation) {
+        return Vec::new();
+    }
+    if !matches!(
+        state.backend_process,
+        ProcessStatus::Running | ProcessStatus::Stopping
+    ) {
+        return Vec::new();
+    }
+    state.backend_ready = false;
+    let was_stopping = state.backend_process == ProcessStatus::Stopping;
+    state.backend_process = ProcessStatus::Stopped;
+    state.backend_process_generation = None;
+    let Some(desired) = state.backend_generation.flatten() else {
+        return Vec::new();
+    };
+    if was_stopping || desired != generation {
+        state.backend_process = ProcessStatus::Starting;
+        state.backend_process_generation = Some(desired);
+        vec![Effect::StartBackend {
+            generation: desired,
+        }]
+    } else {
+        vec![
+            Effect::Log {
+                message: format!("backend exited with {status}"),
+            },
+            Effect::DelayBackendRetry {
+                generation: desired,
+            },
+        ]
+    }
+}
+
+fn reduce_session_created(
+    state: &mut State,
+    role: String,
+    request_id: u64,
+    session_id: String,
+) -> Vec<Effect> {
+    if !state.tasks.iter().any(|(artifact, task)| {
+        artifact.role() == Some(role.as_str())
+            && task.status == TaskStatus::WaitingSession
+            && task.request_id == request_id
+    }) {
+        return Vec::new();
+    }
     let session = Session {
         id: session_id,
         busy: false,
@@ -781,7 +974,7 @@ fn schedule(state: &mut State) -> Vec<Effect> {
 
     let mut effects = Vec::new();
     let mut roles_creating = BTreeSet::new();
-    let mut observer_requested = false;
+    let mut observer_needed = false;
     for artifact in candidates {
         let role = artifact
             .role()
@@ -829,10 +1022,12 @@ fn schedule(state: &mut State) -> Vec<Effect> {
                     request_id,
                 });
             }
-        } else if !observer_requested {
-            observer_requested = true;
-            effects.push(Effect::CreateObserverSession);
+        } else {
+            observer_needed = true;
         }
+    }
+    if observer_needed {
+        request_observer(state, &mut effects);
     }
     effects
 }
@@ -840,9 +1035,6 @@ fn schedule(state: &mut State) -> Vec<Effect> {
 fn compute_host_tasks(state: &State) -> HostTasks {
     let mut required = BTreeSet::new();
     let mut optional = BTreeSet::new();
-    if state.plan_error {
-        required.insert(ArtifactName::parse("system-plan").expect("built-in name"));
-    }
     for (name, artifact) in &state.plan.artifacts {
         if name.role().is_none() {
             continue;
@@ -911,6 +1103,9 @@ mod tests {
         state.backend_generation = Some(Some(1));
         state.backend_ready = true;
         state
+            .artifacts
+            .insert(ArtifactName::parse("system-supervisor").unwrap(), Some(1));
+        state
     }
 
     fn observed(name: &str, modified: Timestamp) -> Event {
@@ -927,14 +1122,33 @@ mod tests {
             observed("query-request", 1)
                 .reduce(&mut state)
                 .iter()
-                .all(|effect| !matches!(effect, Effect::CreateObserverSession))
+                .all(|effect| !matches!(effect, Effect::CreateObserverSession { .. }))
         );
         let effects = observed("system-active", 2).reduce(&mut state);
         assert!(
             effects
                 .iter()
-                .any(|effect| matches!(effect, Effect::CreateObserverSession))
+                .any(|effect| matches!(effect, Effect::CreateObserverSession { .. }))
         );
+        let observer_request = state.observer_request.unwrap();
+        let duplicate = observed("query-request", 3).reduce(&mut state);
+        assert!(
+            duplicate
+                .iter()
+                .all(|effect| !matches!(effect, Effect::CreateObserverSession { .. }))
+        );
+        Event::ObserverSessionCreated {
+            request_id: observer_request + 1,
+            session_id: "stale".into(),
+        }
+        .reduce(&mut state);
+        assert!(state.observer_session.is_none());
+        Event::ObserverSessionCreated {
+            request_id: observer_request,
+            session_id: "current".into(),
+        }
+        .reduce(&mut state);
+        assert_eq!(state.observer_session.as_deref(), Some("current"));
     }
 
     #[test]
@@ -946,6 +1160,7 @@ mod tests {
         let request = state.tasks[&artifact].request_id;
         Event::SessionCreated {
             role: "researcher".into(),
+            request_id: request,
             session_id: "ses_1".into(),
         }
         .reduce(&mut state);
@@ -1016,6 +1231,77 @@ depends-on = ["request", "feedback?"]
             state.host_tasks.opt,
             vec![ArtifactName::parse("feedback").unwrap()]
         );
+    }
+
+    #[test]
+    fn system_plan_only_reloads_on_publish() {
+        let mut state = state();
+        state.plan_generation = Some(Some(10));
+        let removed = Event::ArtifactObserved {
+            name: ArtifactName::parse("system-plan").unwrap(),
+            modified: None,
+        }
+        .reduce(&mut state);
+        assert!(
+            removed
+                .iter()
+                .all(|effect| !matches!(effect, Effect::ReloadPlan))
+        );
+        let published = observed("system-plan", 11).reduce(&mut state);
+        assert!(
+            published
+                .iter()
+                .any(|effect| matches!(effect, Effect::ReloadPlan))
+        );
+    }
+
+    #[test]
+    fn backend_process_transitions_are_reducer_owned() {
+        let mut state = State::new(Arc::new(Plan::parse(EXAMPLE_PLAN).unwrap()));
+        let effects = observed("system-backend", 10).reduce(&mut state);
+        assert_eq!(state.backend_process, ProcessStatus::Starting);
+        assert!(effects.contains(&Effect::StartBackend { generation: 10 }));
+
+        Event::BackendStarted { generation: 10 }.reduce(&mut state);
+        Event::BackendReady { generation: 10 }.reduce(&mut state);
+        assert_eq!(state.backend_process, ProcessStatus::Running);
+        assert!(state.backend_ready);
+
+        let effects = observed("system-backend", 11).reduce(&mut state);
+        assert_eq!(state.backend_process, ProcessStatus::Stopping);
+        assert!(effects.contains(&Effect::StopBackend));
+        let stale = Event::BackendStartFailed {
+            generation: 99,
+            reason: "stale".into(),
+        }
+        .reduce(&mut state);
+        assert!(
+            stale
+                .iter()
+                .all(|effect| !matches!(effect, Effect::StartBackend { .. }))
+        );
+        assert_eq!(state.backend_process, ProcessStatus::Stopping);
+        let effects = Event::BackendExited {
+            generation: 10,
+            status: "stopped".into(),
+        }
+        .reduce(&mut state);
+        assert_eq!(state.backend_process, ProcessStatus::Starting);
+        assert!(effects.contains(&Effect::StartBackend { generation: 11 }));
+
+        Event::BackendStarted { generation: 11 }.reduce(&mut state);
+        let effects = Event::ArtifactObserved {
+            name: ArtifactName::parse("system-backend").unwrap(),
+            modified: None,
+        }
+        .reduce(&mut state);
+        assert!(effects.contains(&Effect::StopBackend));
+        Event::BackendExited {
+            generation: 11,
+            status: "stopped".into(),
+        }
+        .reduce(&mut state);
+        assert_eq!(state.backend_process, ProcessStatus::Stopped);
     }
 
     #[test]
@@ -1100,8 +1386,21 @@ depends-on = ["request", "feedback?"]
                 request_id: 1,
             },
         );
+        let stale = Event::SessionCreateFailed {
+            role: "researcher".into(),
+            request_id: 2,
+            reason: "old backend error".into(),
+        }
+        .reduce(&mut state);
+        assert!(
+            stale
+                .iter()
+                .all(|effect| !matches!(effect, Effect::CreateSession { .. }))
+        );
+        assert_eq!(state.tasks[&artifact].retries, 0);
         let effects = Event::SessionCreateFailed {
             role: "researcher".into(),
+            request_id: 1,
             reason: "backend error".into(),
         }
         .reduce(&mut state);

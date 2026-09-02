@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use filetime::{FileTime, set_file_mtime};
+use once_cell::sync::OnceCell;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -16,12 +17,15 @@ pub struct ArtifactName(String);
 
 impl ArtifactName {
     pub fn parse(value: &str) -> Result<Self> {
-        let part = r"[a-z][0-9a-z]*(?:-[0-9a-z]+)*";
-        let pattern = format!(r"^(?:{part}|{part}\.{part}|_{part}(?:\.{part})?)$");
-        if !Regex::new(&pattern)
+        static PATTERN: OnceCell<Regex> = OnceCell::new();
+        let pattern = PATTERN.get_or_init(|| {
+            let part = r"[a-z][0-9a-z]*(?:-[0-9a-z]+)*";
+            Regex::new(&format!(
+                r"^(?:{part}|{part}\.{part}|_{part}(?:\.{part})?)$"
+            ))
             .expect("valid artifact regex")
-            .is_match(value)
-        {
+        });
+        if !pattern.is_match(value) {
             bail!("invalid artifact name `{value}`");
         }
         Ok(Self(value.to_owned()))

@@ -36,7 +36,10 @@ enum Command {
         #[command(subcommand)]
         command: PlanCommand,
     },
-    Supervisor,
+    Supervisor {
+        #[arg(long, hide = true)]
+        generation: Option<i64>,
+    },
     Run,
     HostTasks {
         #[arg(long, value_name = "SECONDS")]
@@ -67,7 +70,15 @@ pub async fn run() -> Result<()> {
             );
             Ok(())
         }
-        Command::Supervisor => crate::runtime::run(root).await,
+        Command::Supervisor { generation } => {
+            let generation = match generation {
+                Some(generation) => Some(generation),
+                None => crate::runtime::artifact_timestamp(
+                    &ArtifactName::parse("system-supervisor")?.path(&root),
+                )?,
+            };
+            crate::runtime::run(root, generation).await
+        }
         Command::Run => crate::runner::run(root).await,
         Command::HostTasks { poll } => host_tasks(&root, poll).await,
     }

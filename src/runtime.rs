@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 
 use crate::artifact::{ARTIFACTS_DIR, ArtifactName, publish};
 use crate::config::Config;
@@ -21,7 +22,7 @@ use crate::plan::{Backend, Plan};
 use crate::prompt::{build_task_prompt, check_task};
 
 enum BackendCommand {
-    Set(Option<Timestamp>),
+    Start(Timestamp),
     Stop,
 }
 
@@ -32,6 +33,103 @@ struct BackendManagerContext {
     client: Client,
     url: Arc<String>,
     event_tx: mpsc::Sender<Event>,
+}
+
+enum SupervisorControlEvent {
+    Started,
+    PlanLoaded {
+        request_id: u64,
+        plan: Arc<Plan>,
+    },
+    PlanLoadFailed {
+        request_id: u64,
+        generation: Option<Timestamp>,
+        reason: String,
+    },
+    PlanPublishObserved {
+        request_id: u64,
+    },
+    SupervisorDisabled,
+    GenerationExited {
+        request_id: u64,
+        reload: bool,
+    },
+}
+
+enum SupervisorControlEffect {
+    LoadPlan {
+        request_id: u64,
+    },
+    RunGeneration {
+        request_id: u64,
+        plan: Arc<Plan>,
+    },
+    WaitForPlanPublish {
+        request_id: u64,
+        generation: Option<Timestamp>,
+    },
+    PersistHostTasks(crate::db::HostTasks),
+    Log(String),
+    Exit,
+}
+
+#[derive(Default)]
+struct SupervisorControlState {
+    active_request: Option<u64>,
+    next_request: u64,
+}
+
+impl SupervisorControlEvent {
+    fn reduce(self, state: &mut SupervisorControlState) -> Vec<SupervisorControlEffect> {
+        match self {
+            Self::Started => load_plan(state),
+            Self::PlanLoaded { request_id, plan } if state.active_request == Some(request_id) => {
+                vec![
+                    SupervisorControlEffect::PersistHostTasks(Default::default()),
+                    SupervisorControlEffect::RunGeneration { request_id, plan },
+                ]
+            }
+            Self::PlanLoadFailed {
+                request_id,
+                generation,
+                reason,
+            } if state.active_request == Some(request_id) => vec![
+                SupervisorControlEffect::Log(format!("plan load failed: {reason}")),
+                SupervisorControlEffect::PersistHostTasks(crate::db::HostTasks {
+                    tasks: vec![ArtifactName::parse("system-plan").expect("built-in name")],
+                    opt: Vec::new(),
+                }),
+                SupervisorControlEffect::WaitForPlanPublish {
+                    request_id,
+                    generation,
+                },
+            ],
+            Self::PlanPublishObserved { request_id }
+                if state.active_request == Some(request_id) =>
+            {
+                load_plan(state)
+            }
+            Self::GenerationExited { request_id, reload }
+                if state.active_request == Some(request_id) =>
+            {
+                if reload {
+                    load_plan(state)
+                } else {
+                    vec![SupervisorControlEffect::Exit]
+                }
+            }
+            Self::SupervisorDisabled => vec![SupervisorControlEffect::Exit],
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn load_plan(state: &mut SupervisorControlState) -> Vec<SupervisorControlEffect> {
+    state.next_request += 1;
+    state.active_request = Some(state.next_request);
+    vec![SupervisorControlEffect::LoadPlan {
+        request_id: state.next_request,
+    }]
 }
 
 #[derive(Clone)]
@@ -47,43 +145,79 @@ struct EffectContext {
     reload_tx: watch::Sender<bool>,
 }
 
-pub async fn run(root: PathBuf) -> Result<()> {
+pub async fn run(root: PathBuf, expected_supervisor_generation: Option<Timestamp>) -> Result<()> {
     let databases = Databases::initialize(&root)?;
-    let mut attempted_generation = None;
+    let mut state = SupervisorControlState::default();
+    let mut events = std::collections::VecDeque::from([SupervisorControlEvent::Started]);
     loop {
-        match Plan::load(&root) {
-            Ok(plan) => {
-                if !run_generation(root.clone(), Arc::new(plan), databases.clone()).await? {
-                    return Ok(());
+        let event = events
+            .pop_front()
+            .expect("control reducer always produces a terminal event");
+        for effect in event.reduce(&mut state) {
+            match effect {
+                SupervisorControlEffect::LoadPlan { request_id } => {
+                    let event = match Plan::load(&root) {
+                        Ok(plan) => SupervisorControlEvent::PlanLoaded {
+                            request_id,
+                            plan: Arc::new(plan),
+                        },
+                        Err(error) => SupervisorControlEvent::PlanLoadFailed {
+                            request_id,
+                            generation: artifact_timestamp(
+                                &ArtifactName::parse("system-plan")?.path(&root),
+                            )?,
+                            reason: format!("{error:#}"),
+                        },
+                    };
+                    events.push_back(event);
                 }
-                attempted_generation =
-                    artifact_timestamp(&ArtifactName::parse("system-plan")?.path(&root))?;
-            }
-            Err(error) => {
-                eprintln!("plan load failed: {error:#}");
-                let placeholder = Arc::new(Plan::parse("version = 1")?);
-                let mut state = databases.restore(placeholder)?;
-                for effect in Event::PlanLoadFailed.reduce(&mut state) {
-                    match effect {
-                        Effect::PersistHostTasks { tasks } => {
-                            databases.persist_host_tasks(&tasks)?;
-                        }
-                        Effect::PersistTask { artifact, task } => {
-                            databases.persist_task(&artifact, task.as_ref())?;
-                        }
-                        _ => {}
+                SupervisorControlEffect::RunGeneration { request_id, plan } => {
+                    let reload = run_generation(
+                        root.clone(),
+                        plan,
+                        databases.clone(),
+                        expected_supervisor_generation,
+                    )
+                    .await?;
+                    events
+                        .push_back(SupervisorControlEvent::GenerationExited { request_id, reload });
+                }
+                SupervisorControlEffect::WaitForPlanPublish {
+                    request_id,
+                    generation,
+                } => {
+                    if wait_for_artifact_generation(
+                        &root,
+                        "system-plan",
+                        generation,
+                        expected_supervisor_generation,
+                    )
+                    .await?
+                    {
+                        events
+                            .push_back(SupervisorControlEvent::PlanPublishObserved { request_id });
+                    } else {
+                        events.push_back(SupervisorControlEvent::SupervisorDisabled);
                     }
                 }
-                wait_for_artifact_generation(&root, "system-plan", attempted_generation).await?;
-                attempted_generation =
-                    artifact_timestamp(&ArtifactName::parse("system-plan")?.path(&root))?;
+                SupervisorControlEffect::PersistHostTasks(tasks) => {
+                    databases.persist_host_tasks(&tasks)?;
+                }
+                SupervisorControlEffect::Log(message) => eprintln!("{message}"),
+                SupervisorControlEffect::Exit => return Ok(()),
             }
         }
     }
 }
 
-async fn run_generation(root: PathBuf, plan: Arc<Plan>, databases: Databases) -> Result<bool> {
+async fn run_generation(
+    root: PathBuf,
+    plan: Arc<Plan>,
+    databases: Databases,
+    expected_supervisor_generation: Option<Timestamp>,
+) -> Result<bool> {
     let mut state = databases.restore(plan.clone())?;
+    state.supervisor_generation = Some(expected_supervisor_generation);
     let (event_tx, mut event_rx) = mpsc::channel::<Event>(256);
     let (backend_tx, backend_rx) = mpsc::channel(8);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -136,6 +270,7 @@ async fn run_generation(root: PathBuf, plan: Arc<Plan>, databases: Databases) ->
     let mut signal_shutdown = shutdown_rx.clone();
     let mut process_signal = Box::pin(shutdown_signal());
     let mut reload = false;
+    let mut effect_tasks = JoinSet::new();
     loop {
         tokio::select! {
             event = event_rx.recv() => {
@@ -143,10 +278,17 @@ async fn run_generation(root: PathBuf, plan: Arc<Plan>, databases: Databases) ->
                 let effects = event.reduce(&mut state);
                 for effect in effects {
                     if is_persistence(&effect) {
-                        apply_effect(effect, context.clone()).await;
+                        apply_effect(effect, context.clone()).await?;
                     } else {
-                        tokio::spawn(apply_effect(effect, context.clone()));
+                        effect_tasks.spawn(apply_effect(effect, context.clone()));
                     }
+                }
+            }
+            completed = effect_tasks.join_next(), if !effect_tasks.is_empty() => {
+                match completed {
+                    Some(Ok(Err(error))) => eprintln!("effect failed: {error:#}"),
+                    Some(Err(error)) => eprintln!("effect task failed: {error}"),
+                    _ => {}
                 }
             }
             changed = signal_shutdown.changed() => {
@@ -168,6 +310,8 @@ async fn run_generation(root: PathBuf, plan: Arc<Plan>, databases: Databases) ->
     }
 
     let _ = shutdown_tx.send(true);
+    effect_tasks.abort_all();
+    while effect_tasks.join_next().await.is_some() {}
     let _ = backend_tx.send(BackendCommand::Stop).await;
     watcher_handle.abort();
     timeline_handle.abort();
@@ -197,11 +341,17 @@ async fn wait_for_artifact_generation(
     root: &Path,
     name: &str,
     previous: Option<Timestamp>,
-) -> Result<()> {
+    expected_supervisor_generation: Option<Timestamp>,
+) -> Result<bool> {
     let artifact = ArtifactName::parse(name)?;
     loop {
-        if artifact_timestamp(&artifact.path(root))? != previous {
-            return Ok(());
+        let generation = artifact_timestamp(&artifact.path(root))?;
+        if generation.is_some() && generation != previous {
+            return Ok(true);
+        }
+        let supervisor = ArtifactName::parse("system-supervisor")?;
+        if artifact_timestamp(&supervisor.path(root))? != expected_supervisor_generation {
+            return Ok(false);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -216,21 +366,24 @@ fn is_persistence(effect: &Effect) -> bool {
             | Effect::PersistSession { .. }
             | Effect::PersistTask { .. }
             | Effect::PersistHostTasks { .. }
+            | Effect::PersistNextRequest { .. }
     )
 }
 
-async fn apply_effect(effect: Effect, context: Arc<EffectContext>) {
+async fn apply_effect(effect: Effect, context: Arc<EffectContext>) -> Result<()> {
     let failure_target = effect_target(&effect);
     let result = effect.apply(context.clone()).await;
     if let Err(error) = result {
         eprintln!("effect failed: {error:#}");
         if let Some(target) = failure_target {
             let event = match target {
-                FailureTarget::Observer => Event::ObserverSessionCreateFailed {
+                FailureTarget::Observer { request_id } => Event::ObserverSessionCreateFailed {
+                    request_id,
                     reason: error.to_string(),
                 },
-                FailureTarget::Session { role } => Event::SessionCreateFailed {
+                FailureTarget::Session { role, request_id } => Event::SessionCreateFailed {
                     role,
+                    request_id,
                     reason: error.to_string(),
                 },
                 FailureTarget::Task {
@@ -243,14 +396,20 @@ async fn apply_effect(effect: Effect, context: Arc<EffectContext>) {
                 },
             };
             let _ = context.event_tx.send(event).await;
+            return Ok(());
         }
+        return Err(error);
     }
+    Ok(())
 }
 
 enum FailureTarget {
-    Observer,
+    Observer {
+        request_id: u64,
+    },
     Session {
         role: String,
+        request_id: u64,
     },
     Task {
         artifact: ArtifactName,
@@ -260,8 +419,15 @@ enum FailureTarget {
 
 fn effect_target(effect: &Effect) -> Option<FailureTarget> {
     match effect {
-        Effect::CreateObserverSession => Some(FailureTarget::Observer),
-        Effect::CreateSession { role, .. } => Some(FailureTarget::Session { role: role.clone() }),
+        Effect::CreateObserverSession { request_id } => Some(FailureTarget::Observer {
+            request_id: *request_id,
+        }),
+        Effect::CreateSession {
+            role, request_id, ..
+        } => Some(FailureTarget::Session {
+            role: role.clone(),
+            request_id: *request_id,
+        }),
         Effect::PrepareTask {
             artifact,
             request_id,
@@ -306,7 +472,8 @@ impl Effect {
                 context.databases.persist_task(&artifact, task.as_ref())
             }
             Effect::PersistHostTasks { tasks } => context.databases.persist_host_tasks(&tasks),
-            Effect::CreateObserverSession => {
+            Effect::PersistNextRequest { next } => context.databases.persist_next_request_id(next),
+            Effect::CreateObserverSession { request_id } => {
                 let response = context
                     .client
                     .post(format!("{}/session", context.backend_url))
@@ -322,7 +489,10 @@ impl Effect {
                     .to_owned();
                 context
                     .event_tx
-                    .send(Event::ObserverSessionCreated { session_id })
+                    .send(Event::ObserverSessionCreated {
+                        request_id,
+                        session_id,
+                    })
                     .await
                     .map_err(|_| anyhow!("event loop stopped"))?;
                 Ok(())
@@ -362,10 +532,13 @@ impl Effect {
                     .to_owned();
                 context
                     .event_tx
-                    .send(Event::SessionCreated { role, session_id })
+                    .send(Event::SessionCreated {
+                        role,
+                        request_id,
+                        session_id,
+                    })
                     .await
                     .map_err(|_| anyhow!("event loop stopped"))?;
-                let _ = request_id;
                 Ok(())
             }
             Effect::PrepareTask {
@@ -448,11 +621,28 @@ impl Effect {
                 artifact,
                 request_id: _,
             } => publish(&context.root, &artifact),
-            Effect::SetBackend { generation } => context
+            Effect::StartBackend { generation } => context
                 .backend_tx
-                .send(BackendCommand::Set(generation))
+                .send(BackendCommand::Start(generation))
                 .await
                 .map_err(|_| anyhow!("backend manager stopped")),
+            Effect::StopBackend => context
+                .backend_tx
+                .send(BackendCommand::Stop)
+                .await
+                .map_err(|_| anyhow!("backend manager stopped")),
+            Effect::DelayBackendRetry { generation } => {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                context
+                    .event_tx
+                    .send(Event::BackendRetry { generation })
+                    .await
+                    .map_err(|_| anyhow!("event loop stopped"))
+            }
+            Effect::Log { message } => {
+                eprintln!("{message}");
+                Ok(())
+            }
             Effect::ExitSupervisor => {
                 context
                     .shutdown_tx
@@ -478,31 +668,48 @@ fn spawn_backend_manager(
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         let mut child: Option<Child> = None;
-        let mut desired = None;
-        let mut retry = tokio::time::interval(Duration::from_secs(1));
-        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut generation = None;
+        let mut poll = tokio::time::interval(Duration::from_millis(100));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 command = commands.recv() => match command {
-                    Some(BackendCommand::Set(generation)) => {
-                        desired = generation;
-                        if let Some(process) = &mut child {
-                            stop_child(process).await;
-                        }
-                        child = None;
-                        if let Some(generation) = generation {
-                            match start_backend(&context.root, &context.backend, context.port) {
-                                Ok(process) => {
-                                    child = Some(process);
-                                    spawn_backend_health_check(&context, generation);
-                                }
-                                Err(error) => eprintln!("failed to start OpenCode backend: {error:#}"),
+                    Some(BackendCommand::Start(requested)) => {
+                        match start_backend(&context.root, &context.backend, context.port) {
+                            Ok(process) => {
+                                child = Some(process);
+                                generation = Some(requested);
+                                let _ = context.event_tx.send(Event::BackendStarted {
+                                    generation: requested,
+                                }).await;
+                                spawn_backend_health_check(&context, requested);
+                            }
+                            Err(error) => {
+                                let _ = context.event_tx.send(Event::BackendStartFailed {
+                                    generation: requested,
+                                    reason: error.to_string(),
+                                }).await;
                             }
                         }
                     }
-                    Some(BackendCommand::Stop) | None => break,
+                    Some(BackendCommand::Stop) => {
+                        if let (Some(process), Some(active)) = (&mut child, generation) {
+                            stop_child(process).await;
+                            let status = process.try_wait()?.map_or_else(
+                                || "stopped".to_owned(),
+                                |status| status.to_string(),
+                            );
+                            child = None;
+                            generation = None;
+                            let _ = context.event_tx.send(Event::BackendExited {
+                                generation: active,
+                                status,
+                            }).await;
+                        }
+                    }
+                    None => break,
                 },
-                _ = retry.tick() => {
+                _ = poll.tick() => {
                     let exited = child
                         .as_mut()
                         .map(|process| process.try_wait())
@@ -510,19 +717,11 @@ fn spawn_backend_manager(
                         .flatten();
                     if let Some(status) = exited {
                         child = None;
-                        eprintln!("OpenCode backend exited with {status}; restarting");
-                    }
-                    if child.is_none()
-                        && let Some(generation) = desired
-                    {
-                        match start_backend(&context.root, &context.backend, context.port) {
-                            Ok(process) => {
-                                child = Some(process);
-                                spawn_backend_health_check(&context, generation);
-                            }
-                            Err(error) => {
-                                eprintln!("failed to start OpenCode backend: {error:#}");
-                            }
+                        if let Some(active) = generation.take() {
+                            let _ = context.event_tx.send(Event::BackendExited {
+                                generation: active,
+                                status: status.to_string(),
+                            }).await;
                         }
                     }
                 }
@@ -785,6 +984,44 @@ mod tests {
         assert!(matches!(
             event,
             Some(Event::SessionStatusChanged { session_id, busy: true }) if session_id == "ses_1"
+        ));
+    }
+
+    #[test]
+    fn plan_controller_ignores_stale_completions() {
+        let mut state = SupervisorControlState::default();
+        let effects = SupervisorControlEvent::Started.reduce(&mut state);
+        assert!(matches!(
+            effects.as_slice(),
+            [SupervisorControlEffect::LoadPlan { request_id: 1 }]
+        ));
+        assert!(
+            SupervisorControlEvent::PlanLoadFailed {
+                request_id: 99,
+                generation: None,
+                reason: "stale".into(),
+            }
+            .reduce(&mut state)
+            .is_empty()
+        );
+        let effects = SupervisorControlEvent::PlanLoadFailed {
+            request_id: 1,
+            generation: Some(10),
+            reason: "invalid".into(),
+        }
+        .reduce(&mut state);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            SupervisorControlEffect::WaitForPlanPublish {
+                request_id: 1,
+                generation: Some(10)
+            }
+        )));
+        let effects =
+            SupervisorControlEvent::PlanPublishObserved { request_id: 1 }.reduce(&mut state);
+        assert!(matches!(
+            effects.as_slice(),
+            [SupervisorControlEffect::LoadPlan { request_id: 2 }]
         ));
     }
 }
