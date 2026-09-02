@@ -1,0 +1,181 @@
+# RFC 0002：被测 Agent 评测协议
+
+- 状态：草案
+- 创建日期：2026-09-02
+
+## 摘要
+
+本 RFC 定义评测实验中的被测 Agent 协议。评测角色 C 控制题目推进，被测
+OpenCode agent R 在每轮全新会话中作答。Labflow 负责题目投递、轮次状态、
+对话归档、结果转正和会话清理，不负责判断答案质量。
+
+## 计划表面
+
+```toml
+[benchmark."a.b1"]
+records = "benchmarks/a-b1.sqlite"
+depends-on = ["system-active", "_ready.b1"]
+public-knowledge = ["knowledge/public/"]
+
+challenge.source = "datasets/questions.jsonl"
+challenge.questions = "datasets/round-1.ids"
+
+[benchmark."a.b1".respondent]
+read = []
+write = ["b1-ws/a.json"]
+commands = ["just verify"]
+```
+
+名称 `<respondent>.<challenger-role>` 由两个合法的 artifact part 组成。上例中
+`a` 是被测 OpenCode agent R，`b1` 是承担 C 的计划角色。benchmark 自动声明
+worker artifact `bench-a.b1`，其唯一输出和检查项为 `records`。
+
+以下字段都是实验室根目录下的规范化相对路径：
+
+- `records` 必须是文件，表示该 benchmark 独立的追加式 SQLite 数据库；
+- `public-knowledge`、`respondent.read` 和 `respondent.write` 可以是文件或以
+  `/` 结尾的目录；
+- `challenge.source` 和 `challenge.questions` 必须是文件。
+
+自动生成的 `bench-<respondent>.<challenger-role>` 不能与显式 artifact 重名。
+`depends-on` 使用与普通 artifact 相同的依赖语义。
+
+## 题目输入
+
+`challenge.source` 是 UTF-8 JSONL，每个非空行具有唯一的 `id`：
+
+```json
+{"id":"q1","Q":"问题一","K":"仅供 C 使用的澄清知识"}
+```
+
+`challenge.questions` 是 UTF-8 文本，每个非空行包含一个 ID。行首尾空白被
+移除，空行被忽略，不支持注释，不允许重复 ID。文件顺序是本轮题目顺序；
+每个 ID 必须在 source 中唯一存在。
+
+`bench start` 将本轮 ID 及对应 Q、K 快照导入 records。后续命令不重新读取
+source，因此源文件在轮次运行期间变化也不会改变本轮内容。
+
+## 信息与能力边界
+
+C 可以读取题目 source、questions、公开背景和 benchmark 的 records。R：
+
+- 只能通过 `challenge next` 的对话消息取得当前 Q；
+- 不能直接读取 source 或 questions；
+- 不能直接取得 K；
+- 只能通过 `challenge clarify` 取得 C 编写的澄清文本；
+- 可以通过 Read 查看 `public-knowledge + respondent.read`；
+- 可以读写或删除 `respondent.write`；
+- 可以使用 Glob 发现路径，不能使用 Grep；
+- 只能执行 `respondent.commands` 中逐字匹配的固定命令。
+
+R session 的 permission 位于被测 agent 自身 permission 之后，以 OpenCode 的
+最后匹配规则收窄能力。命令不自动添加通配符；`just verify` 不等于
+`just verify *`。Host 对固定命令及其 recipe 不泄漏隐藏信息负责。
+
+## CLI
+
+### 开始轮次
+
+```text
+labflow bench start <name>
+```
+
+定位 `<name>` 的 records，创建状态为 `current` 的新 round，在同一事务中导入
+questions 文件列出的全部题目快照，并创建全新的 R session。成功返回：
+
+```json
+{"round":"<round-id>"}
+```
+
+同一 benchmark 同时只能存在一个 current round。
+
+### 下一题
+
+```text
+labflow challenge next <name>
+```
+
+当前不得有尚未归档的问题。命令从当前 round 的剩余 ID 中按顺序选择下一题，
+将其记录为 current question，只向 R 投递 Q，保存首轮回答，并向 C 返回：
+
+```json
+{"Q":"...","K":"...","reply":"..."}
+```
+
+没有剩余题目时返回严格的 JSON `null`。
+
+### 澄清
+
+```text
+labflow challenge clarify <name> '<text>'
+```
+
+当前必须存在问题，且最多允许三次澄清。Labflow 先记录 C 的文本，再将其投递
+给同一 R session，保存回答并返回：
+
+```json
+{"reply":"..."}
+```
+
+### 归档
+
+```text
+labflow challenge archive <name>
+```
+
+将当前题的 Q、K、首轮回答和全部澄清轮次机械归档，将题目状态改为
+`archived`，并清除 current question。该命令不评价答案质量。
+
+### 完成轮次
+
+```text
+labflow bench finish <name>
+```
+
+只有不存在 pending/current question 时才可完成。Labflow 完成机械汇总，删除
+本轮 R session并等待 OpenCode 确认，然后在 SQLite 事务中将 round 从
+`current` 转为 `committed`。命令成功后 C 才可回答“完成任务。”，随后由
+supervisor check 并 publish `bench-<name>`。
+
+异常中断的轮次和对话记录不删除，可以标记为 `abandoned` 或 `failed`，但分析
+正式结果时只读取 `committed` round。
+
+## Records
+
+records 是每个 benchmark 独立、持续追加的 SQLite 数据库，至少表达：
+
+```text
+bench_rounds
+  id, status, session_id, started_at, committed_at,
+  plan_revision, challenger_agent, respondent_agent
+
+round_questions
+  round_id, question_id, ordinal, q, k, status,
+  first_reply, clarification_count, archived_at
+
+question_turns
+  round_id, question_id, ordinal, speaker, kind, content, created_at
+```
+
+每次 start 创建新 round；所有插入均携带 round ID；finish 只转正当前批次，
+永不覆盖既有 committed 数据。artifact touch file 表示该数据库新增了一批已经
+转正的结果，而不是表示数据库首次创建。
+
+## Reducer/Effect
+
+协议严格遵守 RFC 0001 的 reducer/effect 原则。CLI 只通过 supervisor 控制
+通道提交带 request ID 的意图并等待结果，不能直接读写 records 或调用 OpenCode。
+
+reducer 是以下决策的唯一所有者：
+
+- 当前 round、current question 和剩余题目；
+- 何时创建、使用和删除 R session；
+- 澄清次数、命令前置条件和状态转换；
+- 接受或拒绝异步完成 Event；
+- records Effect、HTTP Effect 和 CLI 响应 Effect 的先后关系；
+- 失败、重试、abandon 和恢复。
+
+Effect 携带执行所需的完整不可变参数，只执行文件读取、SQLite 事务、OpenCode
+HTTP 请求或 CLI 响应，并回投事实 Event。Effect 不能读取 State，executor、
+actor 和 CLI 都不能自行选择题目、推进轮次、重试、切换 session 或判断响应
+是否过期。
