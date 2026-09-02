@@ -120,12 +120,16 @@ impl TaskAnswer {
 
 #[derive(Clone, Debug)]
 pub enum Event {
+    SupervisorStarted,
     ArtifactObserved {
         name: ArtifactName,
         modified: Option<Timestamp>,
     },
     ObserverSessionCreated {
         session_id: String,
+    },
+    ObserverSessionCreateFailed {
+        reason: String,
     },
     SessionCreated {
         role: String,
@@ -220,29 +224,21 @@ pub enum Effect {
 impl Event {
     pub fn reduce(self, state: &mut State) -> Vec<Effect> {
         let mut effects = match self {
+            Event::SupervisorStarted => reduce_supervisor_started(state),
             Event::ArtifactObserved { name, modified } => {
                 reduce_artifact_observed(state, name, modified)
             }
             Event::ObserverSessionCreated { session_id } => {
                 reduce_observer_created(state, session_id)
             }
+            Event::ObserverSessionCreateFailed { reason } => {
+                reduce_observer_create_failed(state, reason)
+            }
             Event::SessionCreated { role, session_id } => {
                 reduce_session_created(state, role, session_id)
             }
             Event::SessionCreateFailed { role, reason } => {
-                let artifacts: Vec<_> = state
-                    .tasks
-                    .iter()
-                    .filter(|(name, task)| {
-                        name.role() == Some(role.as_str())
-                            && task.status == TaskStatus::WaitingSession
-                    })
-                    .map(|(name, _)| name.clone())
-                    .collect();
-                artifacts
-                    .into_iter()
-                    .flat_map(|artifact| fail_task(state, artifact, reason.clone()))
-                    .collect()
+                reduce_session_create_failed(state, role, reason)
             }
             Event::SessionStatusChanged { session_id, busy } => {
                 let Some((role, session)) = state
@@ -296,6 +292,123 @@ impl Event {
         effects.extend(schedule(state));
         effects
     }
+}
+
+fn reduce_supervisor_started(state: &mut State) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    for (role, session) in &mut state.sessions {
+        if session.busy {
+            session.busy = false;
+            effects.push(Effect::PersistSession {
+                role: role.clone(),
+                session: session.clone(),
+            });
+        }
+    }
+
+    let artifacts: Vec<_> = state.tasks.keys().cloned().collect();
+    let mut roles_creating = BTreeSet::new();
+    let mut observer_requested = false;
+    for artifact in artifacts {
+        let role = artifact.role().expect("tasks belong to roles").to_owned();
+        let task = state.tasks.get_mut(&artifact).expect("task exists");
+        if state.sessions.contains_key(&role) {
+            task.status = TaskStatus::Preparing;
+            effects.push(Effect::PersistTask {
+                artifact: artifact.clone(),
+                task: Some(task.clone()),
+            });
+            effects.push(Effect::PrepareTask {
+                artifact,
+                request_id: task.request_id,
+                failures: task.failures.clone(),
+            });
+        } else {
+            task.status = TaskStatus::WaitingSession;
+            effects.push(Effect::PersistTask {
+                artifact: artifact.clone(),
+                task: Some(task.clone()),
+            });
+            if let Some(parent_session_id) = &state.observer_session {
+                if roles_creating.insert(role.clone()) {
+                    effects.push(Effect::CreateSession {
+                        role,
+                        parent_session_id: parent_session_id.clone(),
+                        request_id: task.request_id,
+                    });
+                }
+            } else if !observer_requested {
+                observer_requested = true;
+                effects.push(Effect::CreateObserverSession);
+            }
+        }
+    }
+    effects
+}
+
+fn reduce_observer_create_failed(state: &mut State, reason: String) -> Vec<Effect> {
+    let waiting: Vec<_> = state
+        .tasks
+        .iter()
+        .filter(|(_, task)| task.status == TaskStatus::WaitingSession)
+        .map(|(artifact, _)| artifact.clone())
+        .collect();
+    if waiting.is_empty() {
+        return Vec::new();
+    }
+    if waiting
+        .iter()
+        .any(|artifact| state.tasks[artifact].retries >= 3)
+    {
+        return block_task(state, waiting[0].clone(), None);
+    }
+    let mut effects = Vec::new();
+    for artifact in waiting {
+        let task = state.tasks.get_mut(&artifact).expect("task exists");
+        task.retries += 1;
+        task.failures = vec![reason.clone()];
+        effects.push(Effect::PersistTask {
+            artifact,
+            task: Some(task.clone()),
+        });
+    }
+    effects.push(Effect::CreateObserverSession);
+    effects
+}
+
+fn reduce_session_create_failed(state: &mut State, role: String, reason: String) -> Vec<Effect> {
+    let Some(artifact) = state
+        .tasks
+        .iter()
+        .find(|(name, task)| {
+            name.role() == Some(role.as_str()) && task.status == TaskStatus::WaitingSession
+        })
+        .map(|(name, _)| name.clone())
+    else {
+        return Vec::new();
+    };
+    if state.tasks[&artifact].retries >= 3 {
+        return block_task(state, artifact, None);
+    }
+    let request_id = state.allocate_request();
+    let task = state.tasks.get_mut(&artifact).expect("task exists");
+    task.retries += 1;
+    task.failures = vec![reason];
+    task.request_id = request_id;
+    let mut effects = vec![Effect::PersistTask {
+        artifact,
+        task: Some(task.clone()),
+    }];
+    if let Some(parent_session_id) = &state.observer_session {
+        effects.push(Effect::CreateSession {
+            role,
+            parent_session_id: parent_session_id.clone(),
+            request_id,
+        });
+    } else {
+        effects.push(Effect::CreateObserverSession);
+    }
+    effects
 }
 
 fn reduce_observer_created(state: &mut State, session_id: String) -> Vec<Effect> {
@@ -765,6 +878,14 @@ mod tests {
                 .contains_key(&ArtifactName::parse("_blocked").unwrap())
         );
         assert!(!state.is_active());
+
+        let effects = observed("system-active", 10).reduce(&mut state);
+        assert!(state.is_active());
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PrepareTask { .. }))
+        );
     }
 
     #[test]
@@ -802,6 +923,67 @@ mod tests {
             state
                 .virtual_artifacts
                 .contains_key(&ArtifactName::parse("_blocked").unwrap())
+        );
+    }
+
+    #[test]
+    fn startup_resumes_interrupted_tasks() {
+        let mut state = state();
+        state.observer_session = Some("ses_observer".into());
+        state.sessions.insert(
+            "researcher".into(),
+            Session {
+                id: "ses_worker".into(),
+                busy: true,
+            },
+        );
+        let artifact = ArtifactName::parse("answer.researcher").unwrap();
+        state.tasks.insert(
+            artifact.clone(),
+            Task {
+                status: TaskStatus::Running,
+                retries: 1,
+                failures: vec!["previous".into()],
+                request_id: 7,
+            },
+        );
+        let effects = Event::SupervisorStarted.reduce(&mut state);
+        assert!(!state.sessions["researcher"].busy);
+        assert_eq!(state.tasks[&artifact].status, TaskStatus::Preparing);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PrepareTask { request_id: 7, failures, .. } if failures == &["previous"]
+        )));
+    }
+
+    #[test]
+    fn session_creation_failure_retries_session_creation() {
+        let mut state = state();
+        state.observer_session = Some("ses_observer".into());
+        let artifact = ArtifactName::parse("answer.researcher").unwrap();
+        state.tasks.insert(
+            artifact.clone(),
+            Task {
+                status: TaskStatus::WaitingSession,
+                retries: 0,
+                failures: vec![],
+                request_id: 1,
+            },
+        );
+        let effects = Event::SessionCreateFailed {
+            role: "researcher".into(),
+            reason: "backend error".into(),
+        }
+        .reduce(&mut state);
+        assert_eq!(state.tasks[&artifact].retries, 1);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::CreateSession { parent_session_id, .. } if parent_session_id == "ses_observer"
+        )));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PrepareTask { .. }))
         );
     }
 }

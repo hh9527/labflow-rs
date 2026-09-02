@@ -67,7 +67,11 @@ pub async fn run(root: PathBuf) -> Result<()> {
         backend_rx,
         shutdown_rx.clone(),
     );
-    wait_for_backend(&client, &backend_url).await?;
+    if let Err(error) = wait_for_backend(&client, &backend_url).await {
+        let _ = backend_tx.send(BackendCommand::Stop).await;
+        let _ = backend_handle.await;
+        return Err(error);
+    }
     let watcher_handle =
         spawn_artifact_watcher(root.clone(), event_tx.clone(), shutdown_rx.clone())?;
     let timeline_handle = spawn_timeline_collector(
@@ -79,6 +83,10 @@ pub async fn run(root: PathBuf) -> Result<()> {
         shutdown_rx.clone(),
     );
     scan_artifacts(&root, &event_tx).await?;
+    event_tx
+        .send(Event::SupervisorStarted)
+        .await
+        .map_err(|_| anyhow!("event loop stopped"))?;
 
     let mut signal_shutdown = shutdown_rx.clone();
     loop {
@@ -127,15 +135,14 @@ fn is_persistence(effect: &Effect) -> bool {
 
 async fn apply_effect(effect: Effect, context: Arc<EffectContext>) {
     let failure_target = effect_target(&effect);
-    let result = apply_effect_inner(effect, &context).await;
+    let result = effect.apply(context.clone()).await;
     if let Err(error) = result {
         eprintln!("effect failed: {error:#}");
         if let Some(target) = failure_target {
             let event = match target {
-                FailureTarget::Observer => {
-                    eprintln!("failed to create lab-ob session: {error:#}");
-                    return;
-                }
+                FailureTarget::Observer => Event::ObserverSessionCreateFailed {
+                    reason: error.to_string(),
+                },
                 FailureTarget::Session { role } => Event::SessionCreateFailed {
                     role,
                     reason: error.to_string(),
@@ -194,176 +201,178 @@ fn effect_target(effect: &Effect) -> Option<FailureTarget> {
     }
 }
 
-async fn apply_effect_inner(effect: Effect, context: &EffectContext) -> Result<()> {
-    match effect {
-        Effect::PersistArtifact { name, modified } => {
-            context.databases.persist_artifact(&name, modified)
-        }
-        Effect::PersistVirtualArtifact { name, modified } => {
-            context.databases.persist_virtual(&name, modified)
-        }
-        Effect::PersistObserverSession { session_id } => {
-            context.databases.persist_observer_session(&session_id)
-        }
-        Effect::PersistSession { role, session } => {
-            context.databases.persist_session(&role, &session)
-        }
-        Effect::PersistTask { artifact, task } => {
-            context.databases.persist_task(&artifact, task.as_ref())
-        }
-        Effect::CreateObserverSession => {
-            let response = context
-                .client
-                .post(format!("{}/session", context.backend_url))
-                .query(&[("directory", context.root.to_string_lossy().as_ref())])
-                .json(&json!({ "title": "lab-ob" }))
-                .send()
-                .await?
-                .error_for_status()?;
-            let value: Value = response.json().await?;
-            let session_id = value["id"]
-                .as_str()
-                .context("OpenCode observer session response has no id")?
-                .to_owned();
-            context
-                .event_tx
-                .send(Event::ObserverSessionCreated { session_id })
-                .await
-                .map_err(|_| anyhow!("event loop stopped"))?;
-            Ok(())
-        }
-        Effect::CreateSession {
-            role,
-            parent_session_id,
-            request_id,
-        } => {
-            let permissions = context.plan.roles[&role]
-                .permissions
-                .iter()
-                .map(|permission| {
-                    json!({
-                        "permission": permission,
-                        "pattern": "*",
-                        "action": "allow",
+impl Effect {
+    async fn apply(self, context: Arc<EffectContext>) -> Result<()> {
+        match self {
+            Effect::PersistArtifact { name, modified } => {
+                context.databases.persist_artifact(&name, modified)
+            }
+            Effect::PersistVirtualArtifact { name, modified } => {
+                context.databases.persist_virtual(&name, modified)
+            }
+            Effect::PersistObserverSession { session_id } => {
+                context.databases.persist_observer_session(&session_id)
+            }
+            Effect::PersistSession { role, session } => {
+                context.databases.persist_session(&role, &session)
+            }
+            Effect::PersistTask { artifact, task } => {
+                context.databases.persist_task(&artifact, task.as_ref())
+            }
+            Effect::CreateObserverSession => {
+                let response = context
+                    .client
+                    .post(format!("{}/session", context.backend_url))
+                    .query(&[("directory", context.root.to_string_lossy().as_ref())])
+                    .json(&json!({ "title": "lab-ob" }))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let value: Value = response.json().await?;
+                let session_id = value["id"]
+                    .as_str()
+                    .context("OpenCode observer session response has no id")?
+                    .to_owned();
+                context
+                    .event_tx
+                    .send(Event::ObserverSessionCreated { session_id })
+                    .await
+                    .map_err(|_| anyhow!("event loop stopped"))?;
+                Ok(())
+            }
+            Effect::CreateSession {
+                role,
+                parent_session_id,
+                request_id,
+            } => {
+                let permissions = context.plan.roles[&role]
+                    .permissions
+                    .iter()
+                    .map(|permission| {
+                        json!({
+                            "permission": permission,
+                            "pattern": "*",
+                            "action": "allow",
+                        })
                     })
-                })
-                .collect::<Vec<_>>();
-            let response = context
-                .client
-                .post(format!("{}/session", context.backend_url))
-                .query(&[("directory", context.root.to_string_lossy().as_ref())])
-                .json(&json!({
-                    "parentID": parent_session_id,
-                    "title": format!("labflow:{role}"),
-                    "permission": permissions,
-                }))
-                .send()
-                .await?
-                .error_for_status()?;
-            let value: Value = response.json().await?;
-            let session_id = value["id"]
-                .as_str()
-                .context("OpenCode session response has no id")?
-                .to_owned();
-            context
-                .event_tx
-                .send(Event::SessionCreated { role, session_id })
+                    .collect::<Vec<_>>();
+                let response = context
+                    .client
+                    .post(format!("{}/session", context.backend_url))
+                    .query(&[("directory", context.root.to_string_lossy().as_ref())])
+                    .json(&json!({
+                        "parentID": parent_session_id,
+                        "title": format!("labflow:{role}"),
+                        "permission": permissions,
+                    }))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let value: Value = response.json().await?;
+                let session_id = value["id"]
+                    .as_str()
+                    .context("OpenCode session response has no id")?
+                    .to_owned();
+                context
+                    .event_tx
+                    .send(Event::SessionCreated { role, session_id })
+                    .await
+                    .map_err(|_| anyhow!("event loop stopped"))?;
+                let _ = request_id;
+                Ok(())
+            }
+            Effect::PrepareTask {
+                artifact,
+                request_id,
+                failures,
+            } => {
+                let prompt = build_task_prompt(&context.root, &context.plan, &artifact, &failures)?;
+                context
+                    .event_tx
+                    .send(Event::TaskPrepared {
+                        artifact,
+                        request_id,
+                        prompt,
+                    })
+                    .await
+                    .map_err(|_| anyhow!("event loop stopped"))?;
+                Ok(())
+            }
+            Effect::PromptSession {
+                artifact,
+                role: _,
+                session_id,
+                request_id,
+                prompt,
+            } => {
+                let response = context
+                    .client
+                    .post(format!(
+                        "{}/session/{session_id}/message",
+                        context.backend_url
+                    ))
+                    .query(&[("directory", context.root.to_string_lossy().as_ref())])
+                    .json(&json!({ "parts": [{ "type": "text", "text": prompt }] }))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let value: Value = response.json().await?;
+                let content = value["parts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|part| part["type"] == "text")
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                context
+                    .event_tx
+                    .send(Event::TaskAnswered {
+                        artifact,
+                        request_id,
+                        content,
+                    })
+                    .await
+                    .map_err(|_| anyhow!("event loop stopped"))?;
+                Ok(())
+            }
+            Effect::CheckTask {
+                artifact,
+                request_id,
+            } => {
+                let definition = context
+                    .plan
+                    .artifacts
+                    .get(&artifact)
+                    .context("unknown artifact in check effect")?;
+                let missing = check_task(&context.root, definition);
+                context
+                    .event_tx
+                    .send(Event::TaskChecked {
+                        artifact,
+                        request_id,
+                        missing,
+                    })
+                    .await
+                    .map_err(|_| anyhow!("event loop stopped"))?;
+                Ok(())
+            }
+            Effect::PublishArtifact {
+                artifact,
+                request_id: _,
+            } => publish(&context.root, &artifact),
+            Effect::RestartBackend => context
+                .backend_tx
+                .send(BackendCommand::Restart)
                 .await
-                .map_err(|_| anyhow!("event loop stopped"))?;
-            let _ = request_id;
-            Ok(())
-        }
-        Effect::PrepareTask {
-            artifact,
-            request_id,
-            failures,
-        } => {
-            let prompt = build_task_prompt(&context.root, &context.plan, &artifact, &failures)?;
-            context
-                .event_tx
-                .send(Event::TaskPrepared {
-                    artifact,
-                    request_id,
-                    prompt,
-                })
-                .await
-                .map_err(|_| anyhow!("event loop stopped"))?;
-            Ok(())
-        }
-        Effect::PromptSession {
-            artifact,
-            role: _,
-            session_id,
-            request_id,
-            prompt,
-        } => {
-            let response = context
-                .client
-                .post(format!(
-                    "{}/session/{session_id}/message",
-                    context.backend_url
-                ))
-                .query(&[("directory", context.root.to_string_lossy().as_ref())])
-                .json(&json!({ "parts": [{ "type": "text", "text": prompt }] }))
-                .send()
-                .await?
-                .error_for_status()?;
-            let value: Value = response.json().await?;
-            let content = value["parts"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|part| part["type"] == "text")
-                .filter_map(|part| part["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            context
-                .event_tx
-                .send(Event::TaskAnswered {
-                    artifact,
-                    request_id,
-                    content,
-                })
-                .await
-                .map_err(|_| anyhow!("event loop stopped"))?;
-            Ok(())
-        }
-        Effect::CheckTask {
-            artifact,
-            request_id,
-        } => {
-            let definition = context
-                .plan
-                .artifacts
-                .get(&artifact)
-                .context("unknown artifact in check effect")?;
-            let missing = check_task(&context.root, definition);
-            context
-                .event_tx
-                .send(Event::TaskChecked {
-                    artifact,
-                    request_id,
-                    missing,
-                })
-                .await
-                .map_err(|_| anyhow!("event loop stopped"))?;
-            Ok(())
-        }
-        Effect::PublishArtifact {
-            artifact,
-            request_id: _,
-        } => publish(&context.root, &artifact),
-        Effect::RestartBackend => context
-            .backend_tx
-            .send(BackendCommand::Restart)
-            .await
-            .map_err(|_| anyhow!("backend manager stopped")),
-        Effect::ExitSupervisor => {
-            context
-                .shutdown_tx
-                .send(true)
-                .map_err(|_| anyhow!("supervisor already stopped"))?;
-            Ok(())
+                .map_err(|_| anyhow!("backend manager stopped")),
+            Effect::ExitSupervisor => {
+                context
+                    .shutdown_tx
+                    .send(true)
+                    .map_err(|_| anyhow!("supervisor already stopped"))?;
+                Ok(())
+            }
         }
     }
 }
@@ -587,6 +596,7 @@ fn spawn_timeline_collector(
                     }
                 }
             }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
 }

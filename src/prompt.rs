@@ -173,4 +173,38 @@ mod tests {
         assert!(prompt.contains("- goal.md: 刚更新"));
         assert!(prompt.contains("你上次发布任务结果不成功的原因是:"));
     }
+
+    #[test]
+    fn recursively_expands_directories_and_skips_unpublished_optional_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("materials/nested")).unwrap();
+        fs::write(directory.path().join("goal.md"), "goal").unwrap();
+        fs::write(directory.path().join("materials/nested/data.txt"), "data").unwrap();
+        fs::write(directory.path().join("optional.txt"), "stale optional data").unwrap();
+        let plan = Plan::parse(
+            r#"
+version = 1
+[roles.r]
+kind = "lab-worker"
+[artifacts.source]
+assets = ["materials/"]
+[artifacts.feedback]
+assets = ["optional.txt"]
+[artifacts."result.r"]
+depends-on = ["source", "feedback?"]
+goal = "goal.md"
+"#,
+        )
+        .unwrap();
+        publish(directory.path(), &ArtifactName::parse("source").unwrap()).unwrap();
+        let prompt = build_task_prompt(
+            directory.path(),
+            &plan,
+            &ArtifactName::parse("result.r").unwrap(),
+            &[],
+        )
+        .unwrap();
+        assert!(prompt.contains("- materials/nested/data.txt: 刚更新"));
+        assert!(!prompt.contains("optional.txt"));
+    }
 }

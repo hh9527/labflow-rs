@@ -221,6 +221,21 @@ impl Databases {
     }
 }
 
+pub fn read_virtual_timestamp(root: &Path, name: &ArtifactName) -> Result<Option<Timestamp>> {
+    let path = root.join(STATES_DB);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Connection::open(path)?
+        .query_row(
+            "SELECT modified FROM virtual_artifacts WHERE name = ?1",
+            params![name.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,9 +247,15 @@ mod tests {
         let databases = Databases::initialize(directory.path()).unwrap();
         let artifact = ArtifactName::parse("query-request").unwrap();
         databases.persist_artifact(&artifact, Some(42)).unwrap();
+        let blocked = ArtifactName::parse("_blocked").unwrap();
+        databases.persist_virtual(&blocked, 43).unwrap();
         let state = databases
             .restore(Arc::new(Plan::parse(EXAMPLE_PLAN).unwrap()))
             .unwrap();
         assert_eq!(state.timestamp(&artifact), Some(42));
+        assert_eq!(
+            read_virtual_timestamp(directory.path(), &blocked).unwrap(),
+            Some(43)
+        );
     }
 }

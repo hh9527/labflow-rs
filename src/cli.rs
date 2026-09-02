@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::artifact::{ARTIFACTS_DIR, ArtifactName, publish, unpublish};
+use crate::db::read_virtual_timestamp;
 use crate::plan::{EXAMPLE_PLAN, PLAN_FILE, Plan};
 
 #[derive(Debug, Parser)]
@@ -125,9 +126,27 @@ fn status(root: &Path, filter: Option<&ArtifactName>) -> Result<()> {
     let plan = Plan::load(root)?;
     let names: Vec<_> = match filter {
         Some(name) => vec![name.clone()],
-        None => plan.artifacts.keys().cloned().collect(),
+        None => plan
+            .artifacts
+            .keys()
+            .cloned()
+            .chain(std::iter::once(ArtifactName::parse("_blocked")?))
+            .chain(
+                plan.roles
+                    .keys()
+                    .map(|role| ArtifactName::parse(&format!("_ready.{role}")))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+            .collect(),
     };
     for name in names {
+        if name.is_supervisor() {
+            match read_virtual_timestamp(root, &name)? {
+                Some(modified) => println!("{name}\tpublished\t{modified}"),
+                None => println!("{name}\tnot-published"),
+            }
+            continue;
+        }
         let path = name.path(root);
         match fs::metadata(&path) {
             Ok(metadata) => {

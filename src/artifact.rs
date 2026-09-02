@@ -75,7 +75,16 @@ pub fn publish(root: &Path, name: &ArtifactName) -> Result<()> {
         .truncate(false)
         .open(&path)
         .with_context(|| format!("failed to publish `{name}`"))?;
-    set_file_mtime(&path, FileTime::now())
+    let now = FileTime::now();
+    let previous = FileTime::from_last_modification_time(&fs::metadata(&path)?);
+    let modified = if now > previous {
+        now
+    } else if previous.nanoseconds() == 999_999_999 {
+        FileTime::from_unix_time(previous.unix_seconds().saturating_add(1), 0)
+    } else {
+        FileTime::from_unix_time(previous.unix_seconds(), previous.nanoseconds() + 1)
+    };
+    set_file_mtime(&path, modified)
         .with_context(|| format!("failed to touch `{}`", path.display()))?;
     Ok(())
 }
@@ -92,6 +101,8 @@ pub fn unpublish(root: &Path, name: &ArtifactName) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::UNIX_EPOCH;
+
     use super::*;
 
     #[test]
@@ -112,5 +123,26 @@ mod tests {
             ArtifactName::parse("answer.researcher").unwrap().role(),
             Some("researcher")
         );
+    }
+
+    #[test]
+    fn repeated_publish_moves_mtime_forward() {
+        let directory = tempfile::tempdir().unwrap();
+        let name = ArtifactName::parse("request").unwrap();
+        publish(directory.path(), &name).unwrap();
+        let first = fs::metadata(name.path(directory.path()))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap();
+        publish(directory.path(), &name).unwrap();
+        let second = fs::metadata(name.path(directory.path()))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap();
+        assert!(second > first);
     }
 }

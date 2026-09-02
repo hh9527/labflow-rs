@@ -151,6 +151,15 @@ impl Plan {
         if raw.version != 1 {
             bail!("unsupported plan version {}; expected 1", raw.version);
         }
+        if raw.backend.command.is_empty() {
+            bail!("backend command cannot be empty");
+        }
+        if raw.backend.hostname.is_empty() {
+            bail!("backend hostname cannot be empty");
+        }
+        if raw.backend.port == 0 {
+            bail!("backend port must be non-zero");
+        }
 
         for role in raw.roles.keys() {
             validate_part(role).with_context(|| format!("invalid role `{role}`"))?;

@@ -22,6 +22,18 @@ fn host_can_initialize_publish_and_unpublish() {
         .then_some(())
         .unwrap();
     assert!(directory.path().join("lab-plan.toml").is_file());
+    assert!(
+        labflow()
+            .args([
+                "--root",
+                directory.path().to_str().unwrap(),
+                "plan",
+                "check",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
 
     labflow()
         .args([
