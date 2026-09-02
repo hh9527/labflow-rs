@@ -104,6 +104,16 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def do_PATCH(self):
+        length = int(self.headers.get("content-length", "0"))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        if self.path.startswith("/session/ses_worker?") and isinstance(body.get("title"), str):
+            with open(os.path.join(os.getcwd(), "session-titles.jsonl"), "a", encoding="utf-8") as output:
+                output.write(json.dumps(body) + "\n")
+            self.send_json({"id": "ses_worker", "title": body["title"]})
+        else:
+            self.send_error(404)
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--hostname", default="127.0.0.1")

@@ -146,9 +146,10 @@ check = ["answer.md"]
         ])
         .status()
         .unwrap();
+    let supervisor_output = directory.path().join("supervisor-output.log");
     let mut supervisor = labflow()
         .args(["--root", directory.path().to_str().unwrap(), "supervisor"])
-        .stdout(Stdio::null())
+        .stdout(fs::File::create(&supervisor_output).unwrap())
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
@@ -320,6 +321,22 @@ check = ["answer.md"]
             ("text".into(), None, "succeeded".into()),
         ]
     );
+    let titles = fs::read_to_string(directory.path().join("session-titles.jsonl")).unwrap();
+    let titles = titles
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["title"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert!(titles.contains(&"[researcher] 刷新 answer.researcher".into()));
+    assert!(titles.contains(&"[researcher] 等待任务".into()));
+    let output = fs::read_to_string(supervisor_output).unwrap();
+    assert!(output.contains("answer.researcher 已经启动刷新"));
+    assert!(output.contains("answer.researcher 完成刷新（耗时 "));
+    assert!(output.contains("，最长思考 "));
 }
 
 #[test]

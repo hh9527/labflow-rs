@@ -324,6 +324,17 @@ impl Databases {
         )?;
         Ok(())
     }
+
+    pub fn timeline_turn_started_at(&self, id: u64) -> Result<Option<Timestamp>> {
+        Connection::open(&self.timeline)?
+            .query_row(
+                "SELECT started_at FROM artifact_turn WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
 }
 
 pub fn read_host_tasks(root: &Path) -> Result<HostTasks> {

@@ -396,6 +396,9 @@ fn is_persistence(effect: &Effect) -> bool {
             | Effect::PersistHostTasks { .. }
             | Effect::PersistNextRequest { .. }
             | Effect::MarkTimelineTurnResult { .. }
+            | Effect::RenameSession { .. }
+            | Effect::ReportRefreshStarted { .. }
+            | Effect::ReportRefreshCompleted { .. }
     )
 }
 
@@ -515,6 +518,45 @@ impl Effect {
             Effect::MarkTimelineTurnResult { request_id, result } => context
                 .databases
                 .mark_timeline_turn_result(request_id, &result),
+            Effect::RenameSession { session_id, title } => {
+                let result = context
+                    .client
+                    .patch(format!("{}/session/{session_id}", context.backend_url))
+                    .query(&[("directory", context.root.to_string_lossy().as_ref())])
+                    .json(&json!({ "title": title }))
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status);
+                if let Err(error) = result {
+                    eprintln!("failed to rename session {session_id}: {error}");
+                }
+                Ok(())
+            }
+            Effect::ReportRefreshStarted { artifact } => {
+                println!("[{}] {artifact} 已经启动刷新", local_datetime());
+                Ok(())
+            }
+            Effect::ReportRefreshCompleted {
+                artifact,
+                request_id,
+                longest_reasoning_ms,
+            } => {
+                let started_at = context
+                    .databases
+                    .timeline_turn_started_at(request_id)?
+                    .unwrap_or_else(|| system_time_micros(SystemTime::now()));
+                let elapsed_ms = system_time_micros(SystemTime::now())
+                    .saturating_sub(started_at)
+                    .max(0) as u64
+                    / 1_000;
+                println!(
+                    "[{}] {artifact} 完成刷新（耗时 {}，最长思考 {}）",
+                    local_datetime(),
+                    format_duration(elapsed_ms),
+                    format_duration(longest_reasoning_ms),
+                );
+                Ok(())
+            }
             Effect::CreateObserverSession { request_id } => {
                 let response = context
                     .client
@@ -550,7 +592,7 @@ impl Effect {
                     .query(&[("directory", context.root.to_string_lossy().as_ref())])
                     .json(&json!({
                         "parentID": parent_session_id,
-                        "title": format!("labflow:{role}"),
+                        "title": format!("[{role}] 等待任务"),
                     }))
                     .send()
                     .await?
@@ -623,6 +665,16 @@ impl Effect {
                 let content = response_text(&value);
                 let finished_at = system_time_micros(SystemTime::now());
                 let actions = response_actions(&value, started_at, finished_at);
+                let longest_reasoning_ms = actions
+                    .iter()
+                    .filter(|action| action.kind == "reasoning")
+                    .filter_map(|action| {
+                        action
+                            .finished_at
+                            .map(|end| end.saturating_sub(action.started_at).max(0) as u64)
+                    })
+                    .max()
+                    .unwrap_or_default();
                 let upstream_turn_id = value["info"]["id"].as_str();
                 context.databases.finish_timeline_turn(
                     request_id,
@@ -642,6 +694,7 @@ impl Effect {
                         request_id,
                         agent_id,
                         content,
+                        longest_reasoning_ms,
                     })
                     .await
                     .map_err(|_| anyhow!("event loop stopped"))?;
@@ -1018,6 +1071,18 @@ fn utf8_prefix(value: &str, limit: usize) -> &str {
         end -= 1;
     }
     &value[..end]
+}
+
+fn local_datetime() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn format_duration(milliseconds: u64) -> String {
+    if milliseconds < 1_000 {
+        format!("{milliseconds}ms")
+    } else {
+        format!("{:.3}s", milliseconds as f64 / 1_000.0)
+    }
 }
 
 fn spawn_opencode_event_collector(

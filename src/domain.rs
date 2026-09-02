@@ -110,6 +110,8 @@ pub struct Task {
     pub request_id: u64,
     #[serde(default)]
     pub agent_id: String,
+    #[serde(default)]
+    pub longest_reasoning_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -202,6 +204,7 @@ pub enum Event {
         request_id: u64,
         agent_id: String,
         content: String,
+        longest_reasoning_ms: u64,
     },
     TaskChecked {
         artifact: ArtifactName,
@@ -245,6 +248,18 @@ pub enum Effect {
     MarkTimelineTurnResult {
         request_id: u64,
         result: String,
+    },
+    RenameSession {
+        session_id: String,
+        title: String,
+    },
+    ReportRefreshStarted {
+        artifact: ArtifactName,
+    },
+    ReportRefreshCompleted {
+        artifact: ArtifactName,
+        request_id: u64,
+        longest_reasoning_ms: u64,
     },
     CreateObserverSession {
         request_id: u64,
@@ -407,7 +422,15 @@ impl Event {
                 request_id,
                 agent_id,
                 content,
-            } => reduce_task_answered(state, artifact, request_id, &agent_id, &content),
+                longest_reasoning_ms,
+            } => reduce_task_answered(
+                state,
+                artifact,
+                request_id,
+                &agent_id,
+                &content,
+                longest_reasoning_ms,
+            ),
             Event::TaskChecked {
                 artifact,
                 request_id,
@@ -679,11 +702,25 @@ fn reduce_artifact_observed(
         && let Some(task) = state.tasks.get(&name)
         && task.status == TaskStatus::Publishing
     {
+        let task = task.clone();
+        let role = name.role().expect("published tasks have roles").to_owned();
+        let session_id = state.sessions.get(&role).map(|session| session.id.clone());
         state.tasks.remove(&name);
         effects.push(Effect::PersistTask {
-            artifact: name,
+            artifact: name.clone(),
             task: None,
         });
+        effects.push(Effect::ReportRefreshCompleted {
+            artifact: name,
+            request_id: task.request_id,
+            longest_reasoning_ms: task.longest_reasoning_ms.unwrap_or_default(),
+        });
+        if let Some(session_id) = session_id {
+            effects.push(Effect::RenameSession {
+                session_id,
+                title: format!("[{role}] 等待任务"),
+            });
+        }
     }
     effects
 }
@@ -808,10 +845,17 @@ fn reduce_task_prepared(
             role: role.clone(),
             session: session.clone(),
         },
+        Effect::ReportRefreshStarted {
+            artifact: artifact.clone(),
+        },
+        Effect::RenameSession {
+            session_id: session.id.clone(),
+            title: format!("[{role}] 刷新 {artifact}"),
+        },
         Effect::PromptSession {
             artifact,
             role,
-            session_id: session.id.clone(),
+            session_id: session.id,
             request_id,
             agent_id,
             prompt,
@@ -826,6 +870,7 @@ fn reduce_task_answered(
     request_id: u64,
     agent_id: &str,
     content: &str,
+    longest_reasoning_ms: u64,
 ) -> Vec<Effect> {
     let Some(task) = current_task(state, &artifact, request_id) else {
         return Vec::new();
@@ -833,14 +878,13 @@ fn reduce_task_answered(
     if task.status != TaskStatus::Running || task.agent_id != agent_id {
         return Vec::new();
     }
+    let task = state.tasks.get_mut(&artifact).expect("task exists");
+    task.longest_reasoning_ms = Some(longest_reasoning_ms);
     let session_effect = if let Some(role) = artifact.role()
         && let Some(session) = state.sessions.get_mut(role)
     {
         session.busy = false;
-        Some(Effect::PersistSession {
-            role: role.to_owned(),
-            session: session.clone(),
-        })
+        Some((role.to_owned(), session.clone()))
     } else {
         None
     };
@@ -858,7 +902,7 @@ fn reduce_task_answered(
                     request_id,
                 },
             ];
-            effects.extend(session_effect);
+            extend_session_release(&mut effects, session_effect);
             effects
         }
         TaskAnswer::Unable => block_task(state, artifact, session_effect),
@@ -913,10 +957,7 @@ fn fail_task(state: &mut State, artifact: ArtifactName, reason: String) -> Vec<E
         && let Some(session) = state.sessions.get_mut(role)
     {
         session.busy = false;
-        Some(Effect::PersistSession {
-            role: role.to_owned(),
-            session: session.clone(),
-        })
+        Some((role.to_owned(), session.clone()))
     } else {
         None
     };
@@ -929,6 +970,7 @@ fn fail_task(state: &mut State, artifact: ArtifactName, reason: String) -> Vec<E
     task.failures = reason.lines().map(str::to_owned).collect();
     task.status = TaskStatus::Preparing;
     task.request_id = request_id;
+    task.longest_reasoning_ms = None;
     let mut effects = vec![
         Effect::PersistTask {
             artifact: artifact.clone(),
@@ -940,7 +982,7 @@ fn fail_task(state: &mut State, artifact: ArtifactName, reason: String) -> Vec<E
             failures: task.failures.clone(),
         },
     ];
-    effects.extend(session_effect);
+    extend_session_release(&mut effects, session_effect);
     effects
 }
 
@@ -954,16 +996,29 @@ fn block(state: &mut State) -> Vec<Effect> {
 fn block_task(
     state: &mut State,
     artifact: ArtifactName,
-    session_effect: Option<Effect>,
+    session_effect: Option<(String, Session)>,
 ) -> Vec<Effect> {
     state.tasks.remove(&artifact);
     let mut effects = vec![Effect::PersistTask {
         artifact,
         task: None,
     }];
-    effects.extend(session_effect);
+    extend_session_release(&mut effects, session_effect);
     effects.extend(block(state));
     effects
+}
+
+fn extend_session_release(effects: &mut Vec<Effect>, release: Option<(String, Session)>) {
+    if let Some((role, session)) = release {
+        effects.push(Effect::PersistSession {
+            role: role.clone(),
+            session: session.clone(),
+        });
+        effects.push(Effect::RenameSession {
+            session_id: session.id,
+            title: format!("[{role}] 等待任务"),
+        });
+    }
 }
 
 fn schedule(state: &mut State) -> Vec<Effect> {
@@ -1026,6 +1081,7 @@ fn schedule(state: &mut State) -> Vec<Effect> {
             failures: Vec::new(),
             request_id,
             agent_id: profile.id,
+            longest_reasoning_ms: None,
         };
         state.tasks.insert(artifact.clone(), task.clone());
         effects.push(Effect::PersistTask {
@@ -1201,6 +1257,7 @@ mod tests {
                 .agent_id
                 .clone(),
             content: "无法完成任务。".into(),
+            longest_reasoning_ms: 3,
         }
         .reduce(&mut state);
         assert!(
@@ -1343,6 +1400,7 @@ depends-on = ["request", "feedback?"]
                 failures: vec![],
                 request_id: 1,
                 agent_id: "researcher.test".into(),
+                longest_reasoning_ms: None,
             },
         );
         for expected_retry in 1..=3 {
@@ -1352,6 +1410,7 @@ depends-on = ["request", "feedback?"]
                 request_id: request,
                 agent_id: "researcher.old-agent".into(),
                 content: "bad".into(),
+                longest_reasoning_ms: 3,
             }
             .reduce(&mut state);
             assert_eq!(state.tasks[&artifact].retries, expected_retry - 1);
@@ -1360,6 +1419,7 @@ depends-on = ["request", "feedback?"]
                 request_id: request,
                 agent_id: "researcher.test".into(),
                 content: "bad".into(),
+                longest_reasoning_ms: 3,
             }
             .reduce(&mut state);
             assert_eq!(state.tasks[&artifact].retries, expected_retry);
@@ -1371,12 +1431,94 @@ depends-on = ["request", "feedback?"]
             request_id: request,
             agent_id: "researcher.test".into(),
             content: "bad".into(),
+            longest_reasoning_ms: 3,
         }
         .reduce(&mut state);
         assert!(
             state
                 .virtual_artifacts
                 .contains_key(&ArtifactName::parse("_blocked").unwrap())
+        );
+    }
+
+    #[test]
+    fn reports_refresh_only_after_published_artifact_is_observed() {
+        let mut state = state();
+        let artifact = ArtifactName::parse("answer.researcher").unwrap();
+        state.sessions.insert(
+            "researcher".into(),
+            Session {
+                id: "ses_worker".into(),
+                busy: false,
+            },
+        );
+        state.tasks.insert(
+            artifact.clone(),
+            Task {
+                status: TaskStatus::Publishing,
+                retries: 0,
+                failures: Vec::new(),
+                request_id: 7,
+                agent_id: "researcher.test".into(),
+                longest_reasoning_ms: Some(340),
+            },
+        );
+
+        let effects = Event::ArtifactObserved {
+            name: artifact.clone(),
+            modified: Some(10),
+        }
+        .reduce(&mut state);
+        assert!(effects.contains(&Effect::ReportRefreshCompleted {
+            artifact,
+            request_id: 7,
+            longest_reasoning_ms: 340,
+        }));
+        assert!(effects.contains(&Effect::RenameSession {
+            session_id: "ses_worker".into(),
+            title: "[researcher] 等待任务".into(),
+        }));
+    }
+
+    #[test]
+    fn starting_refresh_reports_and_renames_session() {
+        let mut state = state();
+        let artifact = ArtifactName::parse("answer.researcher").unwrap();
+        state.sessions.insert(
+            "researcher".into(),
+            Session {
+                id: "ses_worker".into(),
+                busy: false,
+            },
+        );
+        state.tasks.insert(
+            artifact.clone(),
+            Task {
+                status: TaskStatus::Preparing,
+                retries: 1,
+                failures: Vec::new(),
+                request_id: 7,
+                agent_id: "researcher.test".into(),
+                longest_reasoning_ms: None,
+            },
+        );
+        let effects = Event::TaskPrepared {
+            artifact: artifact.clone(),
+            request_id: 7,
+            prompt: "prompt".into(),
+        }
+        .reduce(&mut state);
+        assert!(effects.contains(&Effect::ReportRefreshStarted {
+            artifact: artifact.clone(),
+        }));
+        assert!(effects.contains(&Effect::RenameSession {
+            session_id: "ses_worker".into(),
+            title: "[researcher] 刷新 answer.researcher".into(),
+        }));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PromptSession { iteration: 2, .. }))
         );
     }
 
@@ -1400,6 +1542,7 @@ depends-on = ["request", "feedback?"]
                 failures: vec!["previous".into()],
                 request_id: 7,
                 agent_id: "researcher.test".into(),
+                longest_reasoning_ms: None,
             },
         );
         let effects = Event::SupervisorStarted.reduce(&mut state);
@@ -1424,6 +1567,7 @@ depends-on = ["request", "feedback?"]
                 failures: vec![],
                 request_id: 1,
                 agent_id: "researcher.test".into(),
+                longest_reasoning_ms: None,
             },
         );
         let stale = Event::SessionCreateFailed {
