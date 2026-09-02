@@ -69,14 +69,25 @@ enum SupervisorControlEffect {
         generation: Option<Timestamp>,
     },
     PersistHostTasks(crate::db::HostTasks),
+    ClearTasks,
     Log(String),
     Exit,
 }
 
-#[derive(Default)]
 struct SupervisorControlState {
     active_request: Option<u64>,
     next_request: u64,
+    resume_tasks: bool,
+}
+
+impl Default for SupervisorControlState {
+    fn default() -> Self {
+        Self {
+            active_request: None,
+            next_request: 0,
+            resume_tasks: true,
+        }
+    }
 }
 
 impl SupervisorControlEvent {
@@ -84,10 +95,14 @@ impl SupervisorControlEvent {
         match self {
             Self::Started => load_plan(state),
             Self::PlanLoaded { request_id, plan } if state.active_request == Some(request_id) => {
-                vec![
-                    SupervisorControlEffect::PersistHostTasks(Default::default()),
-                    SupervisorControlEffect::RunGeneration { request_id, plan },
-                ]
+                let mut effects =
+                    vec![SupervisorControlEffect::PersistHostTasks(Default::default())];
+                if !state.resume_tasks {
+                    effects.push(SupervisorControlEffect::ClearTasks);
+                }
+                state.resume_tasks = true;
+                effects.push(SupervisorControlEffect::RunGeneration { request_id, plan });
+                effects
             }
             Self::PlanLoadFailed {
                 request_id,
@@ -113,6 +128,7 @@ impl SupervisorControlEvent {
                 if state.active_request == Some(request_id) =>
             {
                 if reload {
+                    state.resume_tasks = false;
                     load_plan(state)
                 } else {
                     vec![SupervisorControlEffect::Exit]
@@ -203,6 +219,7 @@ pub async fn run(root: PathBuf, expected_supervisor_generation: Option<Timestamp
                 SupervisorControlEffect::PersistHostTasks(tasks) => {
                     databases.persist_host_tasks(&tasks)?;
                 }
+                SupervisorControlEffect::ClearTasks => databases.clear_tasks()?,
                 SupervisorControlEffect::Log(message) => eprintln!("{message}"),
                 SupervisorControlEffect::Exit => return Ok(()),
             }
@@ -1023,5 +1040,30 @@ mod tests {
             effects.as_slice(),
             [SupervisorControlEffect::LoadPlan { request_id: 2 }]
         ));
+        let plan = Arc::new(Plan::parse("version = 1").unwrap());
+        SupervisorControlEvent::PlanLoaded {
+            request_id: 2,
+            plan,
+        }
+        .reduce(&mut state);
+        let effects = SupervisorControlEvent::GenerationExited {
+            request_id: 2,
+            reload: true,
+        }
+        .reduce(&mut state);
+        assert!(matches!(
+            effects.as_slice(),
+            [SupervisorControlEffect::LoadPlan { request_id: 3 }]
+        ));
+        let effects = SupervisorControlEvent::PlanLoaded {
+            request_id: 3,
+            plan: Arc::new(Plan::parse("version = 1").unwrap()),
+        }
+        .reduce(&mut state);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, SupervisorControlEffect::ClearTasks))
+        );
     }
 }

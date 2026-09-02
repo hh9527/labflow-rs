@@ -209,6 +209,11 @@ impl Databases {
         Ok(())
     }
 
+    pub fn clear_tasks(&self) -> Result<()> {
+        Connection::open(&self.states)?.execute("DELETE FROM tasks", [])?;
+        Ok(())
+    }
+
     pub fn persist_next_request_id(&self, value: u64) -> Result<()> {
         Connection::open(&self.states)?.execute(
             "INSERT INTO meta(key, value) VALUES ('next_request_id', ?1)

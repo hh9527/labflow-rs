@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::cargo::cargo_bin;
 use labflow::artifact::ArtifactName;
+use labflow::config::Config;
 use labflow::db::{Databases, HostTasks, read_host_tasks};
 use rusqlite::Connection;
 
@@ -30,6 +31,14 @@ fn host_can_initialize_publish_and_unpublish() {
         .then_some(())
         .unwrap();
     assert!(directory.path().join("lab-plan.toml").is_file());
+    assert_eq!(Config::load(directory.path()).unwrap().port, 4096);
+    let run = directory.path().join(".labflow/run");
+    assert!(run.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(fs::metadata(run).unwrap().permissions().mode() & 0o111, 0);
+    }
     assert!(
         labflow()
             .args([
