@@ -1,5 +1,8 @@
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
+use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -9,13 +12,18 @@ use crate::artifact::ArtifactName;
 
 pub const PLAN_FILE: &str = "lab-plan.toml";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Plan {
     pub version: u32,
+    #[serde(default)]
     pub backend: Backend,
-    pub roles: BTreeMap<String, Role>,
+    #[serde(default)]
+    pub roles: BTreeMap<RoleName, Role>,
+    #[serde(default)]
     pub artifacts: BTreeMap<ArtifactName, Artifact>,
-    pub benchmarks: BTreeMap<String, Benchmark>,
+    #[serde(default, rename = "benchmark")]
+    pub benchmarks: BTreeMap<BenchmarkName, Benchmark>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -49,36 +57,47 @@ pub enum RoleKind {
     Evaluator,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Artifact {
+    #[serde(default, rename = "depends-on")]
     pub dependencies: Vec<Dependency>,
-    pub goal: Option<AssetPath>,
+    #[serde(default)]
+    pub goal: Option<FilePath>,
+    #[serde(default)]
     pub assets: Vec<AssetPath>,
     pub inputs: Option<Vec<AssetPath>>,
-    pub check: Vec<AssetPath>,
+    #[serde(default)]
+    pub check: Vec<FilePath>,
     pub permissions: Option<Vec<String>>,
-    pub benchmark: Option<String>,
+    #[serde(skip)]
+    pub benchmark: Option<BenchmarkName>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Benchmark {
+    #[serde(skip)]
     pub respondent: String,
-    pub challenger_role: String,
-    pub artifact: ArtifactName,
-    pub records: AssetPath,
+    pub records: FilePath,
+    #[serde(default, rename = "depends-on")]
     pub dependencies: Vec<Dependency>,
+    #[serde(default, rename = "public-knowledge")]
     pub public_knowledge: Vec<AssetPath>,
     pub challenge: Challenge,
+    #[serde(default, rename = "respondent")]
     pub respondent_access: RespondentAccess,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Challenge {
-    pub source: AssetPath,
-    pub questions: AssetPath,
+    pub source: FilePath,
+    pub questions: FilePath,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RespondentAccess {
     pub read: Vec<AssetPath>,
     pub write: Vec<AssetPath>,
@@ -91,10 +110,135 @@ pub struct Dependency {
     pub optional: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct RoleName(String);
+
+impl RoleName {
+    fn parse(value: &str) -> Result<Self> {
+        validate_part(value)?;
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl<'de> Deserialize<'de> for RoleName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Borrow<str> for RoleName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RoleName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct BenchmarkName(String);
+
+impl BenchmarkName {
+    fn parse(value: &str) -> Result<Self> {
+        let parsed = ArtifactName::parse(value)?;
+        if parsed.role().is_none() {
+            bail!("benchmark name `{value}` must be `<respondent>.<role>`");
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    fn parts(&self) -> (&str, &str) {
+        self.0.split_once('.').expect("validated benchmark name")
+    }
+}
+
+impl<'de> Deserialize<'de> for BenchmarkName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Borrow<str> for BenchmarkName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for BenchmarkName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct AssetPath {
     value: String,
     directory: bool,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct FilePath(AssetPath);
+
+impl FilePath {
+    pub fn parse(value: &str) -> Result<Self> {
+        AssetPath::parse(value, false).map(Self)
+    }
+}
+
+impl<'de> Deserialize<'de> for FilePath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Deref for FilePath {
+    type Target = AssetPath;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Serialize for AssetPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.value)
+    }
+}
+
+impl<'de> Deserialize<'de> for AssetPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(&String::deserialize(deserializer)?, true).map_err(serde::de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for Dependency {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        parse_dependency(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
 }
 
 impl AssetPath {
@@ -139,62 +283,6 @@ impl AssetPath {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawPlan {
-    version: u32,
-    #[serde(default)]
-    backend: Backend,
-    #[serde(default)]
-    roles: BTreeMap<String, Role>,
-    #[serde(default)]
-    artifacts: BTreeMap<String, RawArtifact>,
-    #[serde(default, rename = "benchmark")]
-    benchmarks: BTreeMap<String, RawBenchmark>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawArtifact {
-    #[serde(default, rename = "depends-on")]
-    dependencies: Vec<String>,
-    goal: Option<String>,
-    #[serde(default)]
-    assets: Vec<String>,
-    inputs: Option<Vec<String>>,
-    #[serde(default)]
-    check: Vec<String>,
-    permissions: Option<Vec<String>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawBenchmark {
-    records: String,
-    #[serde(default, rename = "depends-on")]
-    dependencies: Vec<String>,
-    #[serde(default, rename = "public-knowledge")]
-    public_knowledge: Vec<String>,
-    challenge: RawChallenge,
-    #[serde(default)]
-    respondent: RawRespondentAccess,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawChallenge {
-    source: String,
-    questions: String,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct RawRespondentAccess {
-    read: Vec<String>,
-    write: Vec<String>,
-    commands: Vec<String>,
-}
-
 impl Plan {
     pub fn load(root: &Path) -> Result<Self> {
         let path = root.join(PLAN_FILE);
@@ -204,114 +292,63 @@ impl Plan {
     }
 
     pub fn parse(source: &str) -> Result<Self> {
-        let raw: RawPlan = toml::from_str(source).context("invalid TOML")?;
-        if raw.version != 1 {
-            bail!("unsupported plan version {}; expected 1", raw.version);
+        toml::from_str::<Self>(source)
+            .context("invalid TOML")?
+            .normalize()
+    }
+
+    pub fn normalize(mut self) -> Result<Self> {
+        self.artifacts
+            .retain(|_, artifact| artifact.benchmark.is_none());
+        if self.version != 1 {
+            bail!("unsupported plan version {}; expected 1", self.version);
         }
-        if raw.backend.command.is_empty() {
+        if self.backend.command.is_empty() {
             bail!("backend command cannot be empty");
         }
-        if raw.backend.hostname.is_empty() {
+        if self.backend.hostname.is_empty() {
             bail!("backend hostname cannot be empty");
         }
 
-        for role in raw.roles.keys() {
-            validate_part(role).with_context(|| format!("invalid role `{role}`"))?;
-        }
-        for (role, definition) in &raw.roles {
+        for (role, definition) in &self.roles {
             validate_non_file_permissions(&definition.permissions)
                 .with_context(|| format!("invalid permissions for role `{role}`"))?;
         }
 
-        let mut artifacts = BTreeMap::new();
-        for (raw_name, raw_artifact) in raw.artifacts {
-            let name = ArtifactName::parse(&raw_name)?;
+        for (name, artifact) in &self.artifacts {
             if name.is_supervisor() {
                 bail!("supervisor artifact `{name}` is built in and cannot be declared");
             }
-            let dependencies = raw_artifact
-                .dependencies
-                .iter()
-                .map(|value| parse_dependency(value))
-                .collect::<Result<Vec<_>>>()?;
-            let goal = raw_artifact
-                .goal
-                .as_deref()
-                .map(|value| AssetPath::parse(value, false))
-                .transpose()?;
-            let assets = parse_paths(&raw_artifact.assets, true)?;
-            let inputs = raw_artifact
-                .inputs
-                .as_ref()
-                .map(|values| parse_paths(values, true))
-                .transpose()?;
-            let check = parse_paths(&raw_artifact.check, false)?;
-
             if let Some(role) = name.role() {
-                if !raw.roles.contains_key(role) {
+                if !self.roles.contains_key(role) {
                     bail!("artifact `{name}` references unknown role `{role}`");
                 }
-                if goal.is_none() {
+                if artifact.goal.is_none() {
                     bail!("worker artifact `{name}` must declare `goal`");
                 }
-                if let Some(permissions) = &raw_artifact.permissions {
+                if let Some(permissions) = &artifact.permissions {
                     validate_non_file_permissions(permissions)
                         .with_context(|| format!("invalid permissions for artifact `{name}`"))?;
                 }
-            } else if raw_artifact.permissions.is_some() {
+            } else if artifact.permissions.is_some() {
                 bail!("host artifact `{name}` cannot declare `permissions`");
             }
-            artifacts.insert(
-                name,
-                Artifact {
-                    dependencies,
-                    goal,
-                    assets,
-                    inputs,
-                    check,
-                    permissions: raw_artifact.permissions,
-                    benchmark: None,
-                },
-            );
         }
 
-        let mut benchmarks = BTreeMap::new();
-        for (name, raw_benchmark) in raw.benchmarks {
-            let parsed = ArtifactName::parse(&name)
-                .with_context(|| format!("invalid benchmark name `{name}`"))?;
-            let (respondent, challenger_role) = name
-                .split_once('.')
-                .filter(|_| parsed.role().is_some())
-                .with_context(|| {
-                    format!("benchmark name `{name}` must be `<respondent>.<role>`")
-                })?;
+        for (name, benchmark) in &mut self.benchmarks {
+            let (respondent, challenger_role) = name.parts();
             let respondent = respondent.to_owned();
             let challenger_role = challenger_role.to_owned();
-            if !raw.roles.contains_key(&challenger_role) {
+            if !self.roles.contains_key(challenger_role.as_str()) {
                 bail!("benchmark `{name}` references unknown role `{challenger_role}`");
             }
             let artifact_name =
                 ArtifactName::parse(&format!("bench-{respondent}.{challenger_role}"))?;
-            if artifacts.contains_key(&artifact_name) {
+            if self.artifacts.contains_key(&artifact_name) {
                 bail!("benchmark `{name}` conflicts with artifact `{artifact_name}`");
             }
-            let records = AssetPath::parse(&raw_benchmark.records, false)?;
-            let dependencies = raw_benchmark
-                .dependencies
-                .iter()
-                .map(|value| parse_dependency(value))
-                .collect::<Result<Vec<_>>>()?;
-            let public_knowledge = parse_paths(&raw_benchmark.public_knowledge, true)?;
-            let challenge = Challenge {
-                source: AssetPath::parse(&raw_benchmark.challenge.source, false)?,
-                questions: AssetPath::parse(&raw_benchmark.challenge.questions, false)?,
-            };
-            let respondent_access = RespondentAccess {
-                read: parse_paths(&raw_benchmark.respondent.read, true)?,
-                write: parse_paths(&raw_benchmark.respondent.write, true)?,
-                commands: raw_benchmark.respondent.commands,
-            };
-            if respondent_access
+            if benchmark
+                .respondent_access
                 .commands
                 .iter()
                 .any(|command| command.trim().is_empty())
@@ -319,45 +356,27 @@ impl Plan {
                 bail!("benchmark `{name}` has an empty respondent command");
             }
             let mut inputs = BTreeSet::new();
-            inputs.extend(public_knowledge.iter().cloned());
-            inputs.insert(challenge.source.clone());
-            inputs.insert(challenge.questions.clone());
-            artifacts.insert(
+            inputs.extend(benchmark.public_knowledge.iter().cloned());
+            inputs.insert(benchmark.challenge.source.0.clone());
+            inputs.insert(benchmark.challenge.questions.0.clone());
+            benchmark.respondent = respondent;
+            self.artifacts.insert(
                 artifact_name.clone(),
                 Artifact {
-                    dependencies: dependencies.clone(),
+                    dependencies: benchmark.dependencies.clone(),
                     goal: None,
-                    assets: vec![records.clone()],
+                    assets: vec![benchmark.records.0.clone()],
                     inputs: Some(inputs.into_iter().collect()),
-                    check: vec![records.clone()],
+                    check: vec![benchmark.records.clone()],
                     permissions: Some(vec!["bash".into()]),
                     benchmark: Some(name.clone()),
                 },
             );
-            benchmarks.insert(
-                name,
-                Benchmark {
-                    respondent,
-                    challenger_role,
-                    artifact: artifact_name,
-                    records,
-                    dependencies,
-                    public_knowledge,
-                    challenge,
-                    respondent_access,
-                },
-            );
         }
 
-        validate_dependencies(&artifacts, &raw.roles)?;
-        validate_acyclic(&artifacts)?;
-        Ok(Self {
-            version: raw.version,
-            backend: raw.backend,
-            roles: raw.roles,
-            artifacts,
-            benchmarks,
-        })
+        validate_dependencies(&self.artifacts, &self.roles)?;
+        validate_acyclic(&self.artifacts)?;
+        Ok(self)
     }
 
     pub fn artifact_inputs(&self, name: &ArtifactName) -> Vec<AssetPath> {
@@ -385,13 +404,6 @@ fn validate_non_file_permissions(permissions: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn parse_paths(values: &[String], allow_directory: bool) -> Result<Vec<AssetPath>> {
-    values
-        .iter()
-        .map(|value| AssetPath::parse(value, allow_directory))
-        .collect()
-}
-
 fn validate_part(value: &str) -> Result<()> {
     let synthetic = ArtifactName::parse(value)?;
     if synthetic.role().is_some() || synthetic.is_supervisor() {
@@ -413,7 +425,7 @@ fn parse_dependency(value: &str) -> Result<Dependency> {
 
 fn validate_dependencies(
     artifacts: &BTreeMap<ArtifactName, Artifact>,
-    roles: &BTreeMap<String, Role>,
+    roles: &BTreeMap<RoleName, Role>,
 ) -> Result<()> {
     for (name, artifact) in artifacts {
         let mut seen = BTreeSet::new();
@@ -505,6 +517,10 @@ mod tests {
     #[test]
     fn parses_example() {
         let plan = Plan::parse(EXAMPLE_PLAN).unwrap();
+        assert_eq!(
+            plan.clone().normalize().unwrap().artifacts.len(),
+            plan.artifacts.len()
+        );
         let artifact = &plan.artifacts[&ArtifactName::parse("answer.researcher").unwrap()];
         assert_eq!(artifact.inputs, None);
         assert_eq!(artifact.dependencies.len(), 3);
@@ -550,5 +566,25 @@ goal = "goal.md"
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("derived from artifact"));
+    }
+
+    #[test]
+    fn deserialization_enforces_newtype_invariants_before_normalization() {
+        assert!(toml::from_str::<Plan>("version = 1\n[artifacts.BAD]").is_err());
+        assert!(
+            toml::from_str::<Plan>("version = 1\n[roles.BAD]\nkind = 'lab-worker'\n",).is_err()
+        );
+        assert!(
+            toml::from_str::<Plan>(
+                "version = 1\n[roles.r]\nkind = 'lab-worker'\n[artifacts.'a.r']\ngoal = 'goals/'\n",
+            )
+            .is_err()
+        );
+
+        let decoded = toml::from_str::<Plan>(
+            "version = 1\n[roles.r]\nkind = 'lab-worker'\n[artifacts.'a.r']\ngoal = 'goal.md'\ndepends-on = ['missing?']\n",
+        )
+        .unwrap();
+        assert!(decoded.normalize().is_err());
     }
 }

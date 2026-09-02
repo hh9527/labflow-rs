@@ -373,7 +373,7 @@ pub async fn run(root: PathBuf, name: String, command: Command) -> Result<()> {
     let plan = Plan::load(&root)?;
     let benchmark = plan
         .benchmarks
-        .get(&name)
+        .get(name.as_str())
         .cloned()
         .with_context(|| format!("unknown benchmark `{name}`"))?;
     let records = benchmark.records.resolve(&root);

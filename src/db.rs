@@ -116,7 +116,7 @@ impl Databases {
             })?;
             for row in rows {
                 let (role, value) = row?;
-                if state.plan.roles.contains_key(&role) {
+                if state.plan.roles.contains_key(role.as_str()) {
                     state.sessions.insert(role, serde_json::from_str(&value)?);
                 }
             }

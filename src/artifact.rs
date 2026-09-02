@@ -11,9 +11,18 @@ use serde::{Deserialize, Serialize};
 
 pub const ARTIFACTS_DIR: &str = ".labflow/artifacts";
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ArtifactName(String);
+
+impl<'de> Deserialize<'de> for ArtifactName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
 
 impl ArtifactName {
     pub fn parse(value: &str) -> Result<Self> {
