@@ -74,7 +74,7 @@ pub async fn run() -> Result<()> {
             );
             Ok(())
         }
-        Command::Supervisor => bail!("supervisor runtime is not available yet"),
+        Command::Supervisor => crate::runtime::run(root).await,
     }
 }
 

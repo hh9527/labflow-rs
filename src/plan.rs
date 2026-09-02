@@ -30,7 +30,7 @@ impl Default for Backend {
         Self {
             command: vec!["opencode".into(), "serve".into()],
             hostname: "127.0.0.1".into(),
-            port: 0,
+            port: 4096,
         }
     }
 }
@@ -305,7 +305,7 @@ pub const EXAMPLE_PLAN: &str = r#"version = 1
 [backend]
 command = ["opencode", "serve"]
 hostname = "127.0.0.1"
-port = 0
+port = 4096
 
 [roles.researcher]
 kind = "lab-worker"

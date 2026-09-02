@@ -13,10 +13,11 @@ pub struct State {
     pub plan: Arc<Plan>,
     pub artifacts: BTreeMap<ArtifactName, Option<Timestamp>>,
     pub virtual_artifacts: BTreeMap<ArtifactName, Timestamp>,
+    pub observer_session: Option<String>,
     pub sessions: BTreeMap<String, Session>,
     pub tasks: BTreeMap<ArtifactName, Task>,
-    pub backend_generation: Option<Timestamp>,
-    pub supervisor_generation: Option<Timestamp>,
+    pub backend_generation: Option<Option<Timestamp>>,
+    pub supervisor_generation: Option<Option<Timestamp>>,
     pub next_request_id: u64,
 }
 
@@ -32,6 +33,7 @@ impl State {
             plan,
             artifacts,
             virtual_artifacts: BTreeMap::new(),
+            observer_session: None,
             sessions: BTreeMap::new(),
             tasks: BTreeMap::new(),
             backend_generation: None,
@@ -60,6 +62,16 @@ impl State {
         let id = self.next_request_id;
         self.next_request_id += 1;
         id
+    }
+
+    fn next_timestamp(&self) -> Timestamp {
+        self.artifacts
+            .values()
+            .filter_map(|value| *value)
+            .chain(self.virtual_artifacts.values().copied())
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
     }
 }
 
@@ -112,6 +124,9 @@ pub enum Event {
         name: ArtifactName,
         modified: Option<Timestamp>,
     },
+    ObserverSessionCreated {
+        session_id: String,
+    },
     SessionCreated {
         role: String,
         session_id: String,
@@ -119,6 +134,10 @@ pub enum Event {
     SessionCreateFailed {
         role: String,
         reason: String,
+    },
+    SessionStatusChanged {
+        session_id: String,
+        busy: bool,
     },
     TaskPrepared {
         artifact: ArtifactName,
@@ -157,6 +176,9 @@ pub enum Effect {
         name: ArtifactName,
         modified: Timestamp,
     },
+    PersistObserverSession {
+        session_id: String,
+    },
     PersistSession {
         role: String,
         session: Session,
@@ -165,8 +187,10 @@ pub enum Effect {
         artifact: ArtifactName,
         task: Option<Task>,
     },
+    CreateObserverSession,
     CreateSession {
         role: String,
+        parent_session_id: String,
         request_id: u64,
     },
     PrepareTask {
@@ -199,6 +223,9 @@ impl Event {
             Event::ArtifactObserved { name, modified } => {
                 reduce_artifact_observed(state, name, modified)
             }
+            Event::ObserverSessionCreated { session_id } => {
+                reduce_observer_created(state, session_id)
+            }
             Event::SessionCreated { role, session_id } => {
                 reduce_session_created(state, role, session_id)
             }
@@ -216,6 +243,24 @@ impl Event {
                     .into_iter()
                     .flat_map(|artifact| fail_task(state, artifact, reason.clone()))
                     .collect()
+            }
+            Event::SessionStatusChanged { session_id, busy } => {
+                let Some((role, session)) = state
+                    .sessions
+                    .iter_mut()
+                    .find(|(_, session)| session.id == session_id)
+                else {
+                    return Vec::new();
+                };
+                if session.busy == busy {
+                    Vec::new()
+                } else {
+                    session.busy = busy;
+                    vec![Effect::PersistSession {
+                        role: role.clone(),
+                        session: session.clone(),
+                    }]
+                }
             }
             Event::TaskPrepared {
                 artifact,
@@ -253,12 +298,41 @@ impl Event {
     }
 }
 
+fn reduce_observer_created(state: &mut State, session_id: String) -> Vec<Effect> {
+    state.observer_session = Some(session_id.clone());
+    let mut effects = vec![Effect::PersistObserverSession {
+        session_id: session_id.clone(),
+    }];
+    let roles: BTreeSet<_> = state
+        .tasks
+        .iter()
+        .filter(|(_, task)| task.status == TaskStatus::WaitingSession)
+        .filter_map(|(artifact, _)| artifact.role().map(str::to_owned))
+        .collect();
+    for role in roles {
+        let request_id = state
+            .tasks
+            .iter()
+            .find(|(artifact, task)| {
+                artifact.role() == Some(role.as_str()) && task.status == TaskStatus::WaitingSession
+            })
+            .map(|(_, task)| task.request_id)
+            .expect("waiting role has a task");
+        effects.push(Effect::CreateSession {
+            role,
+            parent_session_id: session_id.clone(),
+            request_id,
+        });
+    }
+    effects
+}
+
 fn reduce_artifact_observed(
     state: &mut State,
     name: ArtifactName,
     modified: Option<Timestamp>,
 ) -> Vec<Effect> {
-    let previous = state.artifacts.insert(name.clone(), modified).flatten();
+    state.artifacts.insert(name.clone(), modified);
     let mut effects = vec![Effect::PersistArtifact {
         name: name.clone(),
         modified,
@@ -266,16 +340,22 @@ fn reduce_artifact_observed(
 
     match name.as_str() {
         "system-backend" => {
-            if previous.is_some() && modified > previous {
+            if state.backend_generation.is_some()
+                && modified.is_some()
+                && state.backend_generation != Some(modified)
+            {
                 effects.push(Effect::RestartBackend);
             }
-            state.backend_generation = modified;
+            state.backend_generation = Some(modified);
         }
         "system-supervisor" => {
-            if previous.is_some() && modified > previous {
+            if state.supervisor_generation.is_some()
+                && modified.is_some()
+                && state.supervisor_generation != Some(modified)
+            {
                 effects.push(Effect::ExitSupervisor);
             }
-            state.supervisor_generation = modified;
+            state.supervisor_generation = Some(modified);
         }
         _ => {}
     }
@@ -300,7 +380,7 @@ fn reduce_session_created(state: &mut State, role: String, session_id: String) -
     };
     state.sessions.insert(role.clone(), session.clone());
     let ready = ArtifactName::parse(&format!("_ready.{role}")).expect("validated role");
-    let ready_at = state.next_request_id as Timestamp;
+    let ready_at = state.next_timestamp();
     state.virtual_artifacts.insert(ready.clone(), ready_at);
     let mut effects = vec![
         Effect::PersistSession {
@@ -386,16 +466,22 @@ fn reduce_task_answered(
     if task.status != TaskStatus::Running {
         return Vec::new();
     }
-    if let Some(role) = artifact.role()
+    let session_effect = if let Some(role) = artifact.role()
         && let Some(session) = state.sessions.get_mut(role)
     {
         session.busy = false;
-    }
+        Some(Effect::PersistSession {
+            role: role.to_owned(),
+            session: session.clone(),
+        })
+    } else {
+        None
+    };
     match TaskAnswer::parse(content) {
         TaskAnswer::Completed => {
             state.tasks.get_mut(&artifact).expect("task exists").status = TaskStatus::Checking;
             let task = state.tasks[&artifact].clone();
-            vec![
+            let mut effects = vec![
                 Effect::PersistTask {
                     artifact: artifact.clone(),
                     task: Some(task),
@@ -404,9 +490,11 @@ fn reduce_task_answered(
                     artifact,
                     request_id,
                 },
-            ]
+            ];
+            effects.extend(session_effect);
+            effects
         }
-        TaskAnswer::Unable => block(state),
+        TaskAnswer::Unable => block_task(state, artifact, session_effect),
         TaskAnswer::Invalid => fail_task(state, artifact, "回答内容不符合要求".into()),
     }
 }
@@ -449,13 +537,19 @@ fn fail_task(state: &mut State, artifact: ArtifactName, reason: String) -> Vec<E
     let Some(task) = state.tasks.get(&artifact) else {
         return Vec::new();
     };
-    if let Some(role) = artifact.role()
+    let session_effect = if let Some(role) = artifact.role()
         && let Some(session) = state.sessions.get_mut(role)
     {
         session.busy = false;
-    }
+        Some(Effect::PersistSession {
+            role: role.to_owned(),
+            session: session.clone(),
+        })
+    } else {
+        None
+    };
     if task.retries >= 3 {
-        return block(state);
+        return block_task(state, artifact, session_effect);
     }
     let request_id = state.allocate_request();
     let task = state.tasks.get_mut(&artifact).expect("task exists");
@@ -463,7 +557,7 @@ fn fail_task(state: &mut State, artifact: ArtifactName, reason: String) -> Vec<E
     task.failures = reason.lines().map(str::to_owned).collect();
     task.status = TaskStatus::Preparing;
     task.request_id = request_id;
-    vec![
+    let mut effects = vec![
         Effect::PersistTask {
             artifact: artifact.clone(),
             task: Some(task.clone()),
@@ -473,14 +567,31 @@ fn fail_task(state: &mut State, artifact: ArtifactName, reason: String) -> Vec<E
             request_id: task.request_id,
             failures: task.failures.clone(),
         },
-    ]
+    ];
+    effects.extend(session_effect);
+    effects
 }
 
 fn block(state: &mut State) -> Vec<Effect> {
     let name = ArtifactName::parse("_blocked").expect("built-in name");
-    let modified = state.next_request_id as Timestamp;
+    let modified = state.next_timestamp();
     state.virtual_artifacts.insert(name.clone(), modified);
     vec![Effect::PersistVirtualArtifact { name, modified }]
+}
+
+fn block_task(
+    state: &mut State,
+    artifact: ArtifactName,
+    session_effect: Option<Effect>,
+) -> Vec<Effect> {
+    state.tasks.remove(&artifact);
+    let mut effects = vec![Effect::PersistTask {
+        artifact,
+        task: None,
+    }];
+    effects.extend(session_effect);
+    effects.extend(block(state));
+    effects
 }
 
 fn schedule(state: &mut State) -> Vec<Effect> {
@@ -513,6 +624,7 @@ fn schedule(state: &mut State) -> Vec<Effect> {
 
     let mut effects = Vec::new();
     let mut roles_creating = BTreeSet::new();
+    let mut observer_requested = false;
     for artifact in candidates {
         let role = artifact
             .role()
@@ -552,8 +664,17 @@ fn schedule(state: &mut State) -> Vec<Effect> {
                 request_id,
                 failures: Vec::new(),
             });
-        } else if roles_creating.insert(role.clone()) {
-            effects.push(Effect::CreateSession { role, request_id });
+        } else if let Some(parent_session_id) = &state.observer_session {
+            if roles_creating.insert(role.clone()) {
+                effects.push(Effect::CreateSession {
+                    role,
+                    parent_session_id: parent_session_id.clone(),
+                    request_id,
+                });
+            }
+        } else if !observer_requested {
+            observer_requested = true;
+            effects.push(Effect::CreateObserverSession);
         }
     }
     effects
@@ -604,12 +725,14 @@ mod tests {
             observed("query-request", 1)
                 .reduce(&mut state)
                 .iter()
-                .all(|effect| !matches!(effect, Effect::CreateSession { .. }))
+                .all(|effect| !matches!(effect, Effect::CreateObserverSession))
         );
         let effects = observed("system-active", 2).reduce(&mut state);
-        assert!(effects.iter().any(
-            |effect| matches!(effect, Effect::CreateSession { role, .. } if role == "researcher")
-        ));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CreateObserverSession))
+        );
     }
 
     #[test]
