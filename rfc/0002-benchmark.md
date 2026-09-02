@@ -89,6 +89,8 @@ questions 文件列出的全部题目快照，并创建全新的 R session。成
 
 同一 benchmark 同时只能存在一个 current round。R session 不设置 OpenCode
 `parentID`；它与 C 的归属是 records 中 current round 所表达的逻辑关系。
+因此 R 可称为 C 的逻辑子会话，但在 OpenCode 中直接使用顶层 session；只有 C 的
+会话由 DAG 管理，R 的会话过程不进入 timeline.sqlite 或 states.sqlite。
 
 ### 下一题
 

@@ -5,6 +5,7 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 session_count = 0
+benchmark_session = None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -33,10 +34,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        global session_count
+        global session_count, benchmark_session
         length = int(self.headers.get("content-length", "0"))
         body = json.loads(self.rfile.read(length) or b"{}")
         if self.path.startswith("/session?"):
+            if body.get("title", "").startswith("labflow:bench:"):
+                if "parentID" in body or "permission" not in body:
+                    self.send_error(400)
+                    return
+                benchmark_session = "ses_respondent"
+                with open(os.path.join(os.getcwd(), "benchmark-session.json"), "w", encoding="utf-8") as output:
+                    json.dump(body, output)
+                self.send_json({"id": benchmark_session})
+                return
             session_count += 1
             if session_count == 1:
                 if body.get("title") != "lab-ob":
@@ -48,6 +58,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_error(400)
                     return
                 self.send_json({"id": "ses_worker"})
+        elif self.path.startswith("/session/ses_respondent/message?"):
+            with open(os.path.join(os.getcwd(), "benchmark-messages.jsonl"), "a", encoding="utf-8") as output:
+                output.write(json.dumps(body) + "\n")
+            self.send_json({
+                "info": {"id": "msg_respondent"},
+                "parts": [{"type": "text", "text": "respondent reply"}],
+            })
         elif self.path.startswith("/session/ses_worker/message?"):
             if not body.get("agent", "").startswith("researcher."):
                 self.send_error(400)
@@ -58,6 +75,16 @@ class Handler(BaseHTTPRequestHandler):
                 "info": {"id": "msg_fake"},
                 "parts": [{"type": "text", "text": "完成任务。"}],
             })
+        else:
+            self.send_error(404)
+
+    def do_DELETE(self):
+        global benchmark_session
+        if self.path.startswith("/session/ses_respondent?") and benchmark_session:
+            benchmark_session = None
+            with open(os.path.join(os.getcwd(), "benchmark-deleted"), "w", encoding="utf-8") as output:
+                output.write("deleted\n")
+            self.send_json({"ok": True})
         else:
             self.send_error(404)
 

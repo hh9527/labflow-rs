@@ -15,6 +15,7 @@ pub struct Plan {
     pub backend: Backend,
     pub roles: BTreeMap<String, Role>,
     pub artifacts: BTreeMap<ArtifactName, Artifact>,
+    pub benchmarks: BTreeMap<String, Benchmark>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -56,6 +57,32 @@ pub struct Artifact {
     pub inputs: Option<Vec<AssetPath>>,
     pub check: Vec<AssetPath>,
     pub permissions: Option<Vec<String>>,
+    pub benchmark: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Benchmark {
+    pub respondent: String,
+    pub challenger_role: String,
+    pub artifact: ArtifactName,
+    pub records: AssetPath,
+    pub dependencies: Vec<Dependency>,
+    pub public_knowledge: Vec<AssetPath>,
+    pub challenge: Challenge,
+    pub respondent_access: RespondentAccess,
+}
+
+#[derive(Clone, Debug)]
+pub struct Challenge {
+    pub source: AssetPath,
+    pub questions: AssetPath,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RespondentAccess {
+    pub read: Vec<AssetPath>,
+    pub write: Vec<AssetPath>,
+    pub commands: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,6 +149,8 @@ struct RawPlan {
     roles: BTreeMap<String, Role>,
     #[serde(default)]
     artifacts: BTreeMap<String, RawArtifact>,
+    #[serde(default, rename = "benchmark")]
+    benchmarks: BTreeMap<String, RawBenchmark>,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +165,34 @@ struct RawArtifact {
     #[serde(default)]
     check: Vec<String>,
     permissions: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBenchmark {
+    records: String,
+    #[serde(default, rename = "depends-on")]
+    dependencies: Vec<String>,
+    #[serde(default, rename = "public-knowledge")]
+    public_knowledge: Vec<String>,
+    challenge: RawChallenge,
+    #[serde(default)]
+    respondent: RawRespondentAccess,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawChallenge {
+    source: String,
+    questions: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawRespondentAccess {
+    read: Vec<String>,
+    write: Vec<String>,
+    commands: Vec<String>,
 }
 
 impl Plan {
@@ -213,6 +270,81 @@ impl Plan {
                     inputs,
                     check,
                     permissions: raw_artifact.permissions,
+                    benchmark: None,
+                },
+            );
+        }
+
+        let mut benchmarks = BTreeMap::new();
+        for (name, raw_benchmark) in raw.benchmarks {
+            let parsed = ArtifactName::parse(&name)
+                .with_context(|| format!("invalid benchmark name `{name}`"))?;
+            let (respondent, challenger_role) = name
+                .split_once('.')
+                .filter(|_| parsed.role().is_some())
+                .with_context(|| {
+                    format!("benchmark name `{name}` must be `<respondent>.<role>`")
+                })?;
+            let respondent = respondent.to_owned();
+            let challenger_role = challenger_role.to_owned();
+            if !raw.roles.contains_key(&challenger_role) {
+                bail!("benchmark `{name}` references unknown role `{challenger_role}`");
+            }
+            let artifact_name =
+                ArtifactName::parse(&format!("bench-{respondent}.{challenger_role}"))?;
+            if artifacts.contains_key(&artifact_name) {
+                bail!("benchmark `{name}` conflicts with artifact `{artifact_name}`");
+            }
+            let records = AssetPath::parse(&raw_benchmark.records, false)?;
+            let dependencies = raw_benchmark
+                .dependencies
+                .iter()
+                .map(|value| parse_dependency(value))
+                .collect::<Result<Vec<_>>>()?;
+            let public_knowledge = parse_paths(&raw_benchmark.public_knowledge, true)?;
+            let challenge = Challenge {
+                source: AssetPath::parse(&raw_benchmark.challenge.source, false)?,
+                questions: AssetPath::parse(&raw_benchmark.challenge.questions, false)?,
+            };
+            let respondent_access = RespondentAccess {
+                read: parse_paths(&raw_benchmark.respondent.read, true)?,
+                write: parse_paths(&raw_benchmark.respondent.write, true)?,
+                commands: raw_benchmark.respondent.commands,
+            };
+            if respondent_access
+                .commands
+                .iter()
+                .any(|command| command.trim().is_empty())
+            {
+                bail!("benchmark `{name}` has an empty respondent command");
+            }
+            let mut inputs = BTreeSet::new();
+            inputs.extend(public_knowledge.iter().cloned());
+            inputs.insert(challenge.source.clone());
+            inputs.insert(challenge.questions.clone());
+            artifacts.insert(
+                artifact_name.clone(),
+                Artifact {
+                    dependencies: dependencies.clone(),
+                    goal: None,
+                    assets: vec![records.clone()],
+                    inputs: Some(inputs.into_iter().collect()),
+                    check: vec![records.clone()],
+                    permissions: Some(vec!["bash".into()]),
+                    benchmark: Some(name.clone()),
+                },
+            );
+            benchmarks.insert(
+                name,
+                Benchmark {
+                    respondent,
+                    challenger_role,
+                    artifact: artifact_name,
+                    records,
+                    dependencies,
+                    public_knowledge,
+                    challenge,
+                    respondent_access,
                 },
             );
         }
@@ -224,6 +356,7 @@ impl Plan {
             backend: raw.backend,
             roles: raw.roles,
             artifacts,
+            benchmarks,
         })
     }
 

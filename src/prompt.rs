@@ -20,6 +20,11 @@ pub fn build_task_prompt(
         .artifacts
         .get(name)
         .with_context(|| format!("unknown artifact `{name}`"))?;
+    if let Some(benchmark) = &artifact.benchmark {
+        return Ok(format!(
+            "任务: {name}\n\n要求:\n- 执行 `labflow bench start {benchmark}` 开始本轮评测\n- 反复执行 `labflow challenge next {benchmark}`，根据返回的 Q、K 和 reply 决定是否使用 `labflow challenge clarify {benchmark} '<澄清文本>'`\n- 每道题完成后执行 `labflow challenge archive {benchmark}`\n- next 返回 null 后执行 `labflow bench finish {benchmark}`\n- 完成后必须先严格回答“完成任务。”，然后再做其他解释\n- 确实无法完成，则必须先严格回答“无法完成任务。”，然后再做其他解释\n"
+        ));
+    }
     let inputs = effective_inputs(root, plan, artifact)?;
     build_task_prompt_with_inputs(root, plan, name, failures, &inputs)
 }

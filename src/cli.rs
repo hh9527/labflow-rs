@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::artifact::{ARTIFACTS_DIR, ArtifactName, publish, unpublish};
+use crate::benchmark;
 use crate::config::{CONFIG_FILE, Config};
 use crate::db::{read_host_tasks, read_virtual_timestamp};
 use crate::plan::{EXAMPLE_PLAN, PLAN_FILE, Plan};
@@ -45,6 +46,27 @@ enum Command {
         #[arg(long, value_name = "SECONDS")]
         poll: Option<u64>,
     },
+    Bench {
+        #[command(subcommand)]
+        command: BenchCommand,
+    },
+    Challenge {
+        #[command(subcommand)]
+        command: ChallengeCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BenchCommand {
+    Start { name: String },
+    Finish { name: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum ChallengeCommand {
+    Next { name: String },
+    Clarify { name: String, text: String },
+    Archive { name: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -81,6 +103,25 @@ pub async fn run() -> Result<()> {
         }
         Command::Run => crate::runner::run(root).await,
         Command::HostTasks { poll } => host_tasks(&root, poll).await,
+        Command::Bench { command } => match command {
+            BenchCommand::Start { name } => {
+                benchmark::run(root, name, benchmark::Command::Start).await
+            }
+            BenchCommand::Finish { name } => {
+                benchmark::run(root, name, benchmark::Command::Finish).await
+            }
+        },
+        Command::Challenge { command } => match command {
+            ChallengeCommand::Next { name } => {
+                benchmark::run(root, name, benchmark::Command::Next).await
+            }
+            ChallengeCommand::Clarify { name, text } => {
+                benchmark::run(root, name, benchmark::Command::Clarify(text)).await
+            }
+            ChallengeCommand::Archive { name } => {
+                benchmark::run(root, name, benchmark::Command::Archive).await
+            }
+        },
     }
 }
 

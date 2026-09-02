@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod artifact;
+pub mod benchmark;
 pub mod cli;
 pub mod config;
 pub mod db;
