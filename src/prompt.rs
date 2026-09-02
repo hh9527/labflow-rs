@@ -20,6 +20,21 @@ pub fn build_task_prompt(
         .artifacts
         .get(name)
         .with_context(|| format!("unknown artifact `{name}`"))?;
+    let inputs = effective_inputs(root, plan, artifact)?;
+    build_task_prompt_with_inputs(root, plan, name, failures, &inputs)
+}
+
+pub fn build_task_prompt_with_inputs(
+    root: &Path,
+    plan: &Plan,
+    name: &ArtifactName,
+    failures: &[String],
+    inputs: &[AssetPath],
+) -> Result<String> {
+    let artifact = plan
+        .artifacts
+        .get(name)
+        .with_context(|| format!("unknown artifact `{name}`"))?;
     let goal = artifact
         .goal
         .as_ref()
@@ -44,7 +59,6 @@ pub fn build_task_prompt(
     }
 
     prompt.push_str("\n本次任务依赖的文件:\n");
-    let inputs = effective_inputs(root, plan, artifact)?;
     let mut files = BTreeSet::new();
     files.insert(goal.as_str().to_owned());
     for input in inputs {

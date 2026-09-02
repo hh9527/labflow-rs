@@ -50,7 +50,7 @@ hostname = "127.0.0.1"
 
 [roles.researcher]
 kind = "lab-worker"
-permissions = ["read", "edit"]
+permissions = ["webfetch"]
 
 [artifacts.query-request]
 assets = ["goal.md"]
@@ -60,9 +60,13 @@ depends-on = ["system-active", "_ready.researcher", "query-request"]
 goal = "goal.md"
 assets = ["answer.md"]
 check = ["answer.md"]
-permissions = ["read", "edit"]
+permissions = ["webfetch"]
 ```
 
 artifact 的角色始终是后缀，例如 `answer.researcher`。Host 可以通过 publish
 普通名称或 `!名称` 操作任意非 `_` artifact；`_ready.researcher`、`_blocked`
 等名称仅由 supervisor 控制。
+
+文件访问由 artifact 自动确定：`assets` 可读写和删除，`inputs` 只读，`goal`
+只读；Glob 允许发现路径，Grep 禁用。手写 `permissions` 只声明其他 OpenCode
+能力，`read`、`edit`、`glob`、`grep` 是保留名称。

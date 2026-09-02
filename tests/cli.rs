@@ -123,7 +123,7 @@ command = ["python3", "{}"]
 hostname = "127.0.0.1"
 [roles.researcher]
 kind = "lab-worker"
-permissions = ["read"]
+permissions = []
 [artifacts.query-request]
 assets = ["goal.md"]
 [artifacts."answer.researcher"]
@@ -222,7 +222,10 @@ check = ["answer.md"]
     assert!(agent_name.starts_with("researcher."));
     assert!(agent_name.ends_with(".md"));
     let agent = fs::read_to_string(agents[0].path()).unwrap();
-    assert!(agent.contains(r#"permission: {"*":"deny","read":"allow"}"#));
+    assert!(agent.contains(r#""glob":"allow""#));
+    assert!(agent.contains(r#""grep":"deny""#));
+    assert!(agent.contains(r#""read":{"*":"deny","answer.md":"allow","goal.md":"allow"}"#));
+    assert!(agent.contains(r#""edit":{"*":"deny","answer.md":"allow"}"#));
     wait_until(Duration::from_secs(10), || {
         Connection::open(directory.path().join(".labflow/timeline.sqlite"))
             .and_then(|connection| {

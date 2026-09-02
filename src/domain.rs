@@ -452,14 +452,14 @@ fn reduce_supervisor_started(state: &mut State) -> Vec<Effect> {
         }
     }
 
-    let profiles = crate::agent::profiles(&state.plan);
     let artifacts: Vec<_> = state.tasks.keys().cloned().collect();
     let mut roles_creating = BTreeSet::new();
     let mut observer_needed = false;
     for artifact in artifacts {
         let role = artifact.role().expect("tasks belong to roles").to_owned();
         let task = state.tasks.get_mut(&artifact).expect("task exists");
-        task.agent_id = profiles[&artifact].id.clone();
+        let profile = crate::agent::profile(&state.plan, &artifact);
+        task.agent_id = profile.id;
         if state.sessions.contains_key(&role) {
             task.status = TaskStatus::Preparing;
             effects.push(Effect::PersistTask {
@@ -982,7 +982,6 @@ fn schedule(state: &mut State) -> Vec<Effect> {
         .map(|(name, _)| name.clone())
         .collect();
 
-    let profiles = crate::agent::profiles(&state.plan);
     let mut effects = Vec::new();
     let mut roles_creating = BTreeSet::new();
     let mut observer_needed = false;
@@ -1003,6 +1002,7 @@ fn schedule(state: &mut State) -> Vec<Effect> {
             continue;
         }
         let request_id = state.allocate_request();
+        let profile = crate::agent::profile(&state.plan, &artifact);
         let status = if state.sessions.contains_key(&role) {
             TaskStatus::Preparing
         } else {
@@ -1013,12 +1013,12 @@ fn schedule(state: &mut State) -> Vec<Effect> {
             retries: 0,
             failures: Vec::new(),
             request_id,
-            agent_id: profiles[&artifact].id.clone(),
+            agent_id: profile.id,
         };
         state.tasks.insert(artifact.clone(), task.clone());
         effects.push(Effect::PersistTask {
             artifact: artifact.clone(),
-            task: Some(task),
+            task: Some(task.clone()),
         });
         if status == TaskStatus::Preparing {
             effects.push(Effect::PrepareTask {

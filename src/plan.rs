@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::artifact::ArtifactName;
 
@@ -64,7 +64,7 @@ pub struct Dependency {
     pub optional: bool,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct AssetPath {
     value: String,
     directory: bool,
@@ -161,6 +161,10 @@ impl Plan {
         for role in raw.roles.keys() {
             validate_part(role).with_context(|| format!("invalid role `{role}`"))?;
         }
+        for (role, definition) in &raw.roles {
+            validate_non_file_permissions(&definition.permissions)
+                .with_context(|| format!("invalid permissions for role `{role}`"))?;
+        }
 
         let mut artifacts = BTreeMap::new();
         for (raw_name, raw_artifact) in raw.artifacts {
@@ -193,6 +197,10 @@ impl Plan {
                 if goal.is_none() {
                     bail!("worker artifact `{name}` must declare `goal`");
                 }
+                if let Some(permissions) = &raw_artifact.permissions {
+                    validate_non_file_permissions(permissions)
+                        .with_context(|| format!("invalid permissions for artifact `{name}`"))?;
+                }
             } else if raw_artifact.permissions.is_some() {
                 bail!("host artifact `{name}` cannot declare `permissions`");
             }
@@ -218,6 +226,30 @@ impl Plan {
             artifacts,
         })
     }
+
+    pub fn artifact_inputs(&self, name: &ArtifactName) -> Vec<AssetPath> {
+        let artifact = &self.artifacts[name];
+        if let Some(inputs) = &artifact.inputs {
+            return inputs.clone();
+        }
+        artifact
+            .dependencies
+            .iter()
+            .filter_map(|dependency| self.artifacts.get(&dependency.name))
+            .flat_map(|dependency| dependency.assets.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+}
+
+fn validate_non_file_permissions(permissions: &[String]) -> Result<()> {
+    for permission in permissions {
+        if matches!(permission.as_str(), "read" | "edit" | "glob" | "grep") {
+            bail!("`{permission}` is derived from artifact assets and inputs");
+        }
+    }
+    Ok(())
 }
 
 fn parse_paths(values: &[String], allow_directory: bool) -> Result<Vec<AssetPath>> {
@@ -343,6 +375,10 @@ mod tests {
         let artifact = &plan.artifacts[&ArtifactName::parse("answer.researcher").unwrap()];
         assert_eq!(artifact.inputs, None);
         assert_eq!(artifact.dependencies.len(), 3);
+        assert_eq!(
+            plan.artifact_inputs(&ArtifactName::parse("answer.researcher").unwrap()),
+            vec![AssetPath::parse("goal.md", true).unwrap()]
+        );
     }
 
     #[test]
@@ -366,5 +402,20 @@ depends-on = ["a.r"]
         );
         assert!(AssetPath::parse("../secret", true).is_err());
         assert!(AssetPath::parse("output/", false).is_err());
+    }
+
+    #[test]
+    fn rejects_manually_declared_file_permissions() {
+        let error = Plan::parse(
+            r#"version = 1
+[roles.r]
+kind = "lab-worker"
+permissions = ["read"]
+[artifacts."a.r"]
+goal = "goal.md"
+"#,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("derived from artifact"));
     }
 }
