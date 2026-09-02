@@ -704,6 +704,7 @@ dependencies = [
  "filetime",
  "futures-util",
  "inotify",
+ "libc",
  "predicates",
  "regex",
  "reqwest",

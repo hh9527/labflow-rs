@@ -14,14 +14,24 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::artifact::{ARTIFACTS_DIR, ArtifactName, publish};
+use crate::config::Config;
 use crate::db::Databases;
 use crate::domain::{Effect, Event, Timestamp};
 use crate::plan::{Backend, Plan};
 use crate::prompt::{build_task_prompt, check_task};
 
 enum BackendCommand {
-    Restart,
+    Set(Option<Timestamp>),
     Stop,
+}
+
+struct BackendManagerContext {
+    root: PathBuf,
+    backend: Backend,
+    port: u16,
+    client: Client,
+    url: Arc<String>,
+    event_tx: mpsc::Sender<Event>,
 }
 
 #[derive(Clone)]
@@ -34,19 +44,52 @@ struct EffectContext {
     event_tx: mpsc::Sender<Event>,
     backend_tx: mpsc::Sender<BackendCommand>,
     shutdown_tx: watch::Sender<bool>,
+    reload_tx: watch::Sender<bool>,
 }
 
 pub async fn run(root: PathBuf) -> Result<()> {
-    let plan = Arc::new(Plan::load(&root)?);
     let databases = Databases::initialize(&root)?;
+    let mut attempted_generation = None;
+    loop {
+        match Plan::load(&root) {
+            Ok(plan) => {
+                if !run_generation(root.clone(), Arc::new(plan), databases.clone()).await? {
+                    return Ok(());
+                }
+                attempted_generation =
+                    artifact_timestamp(&ArtifactName::parse("system-plan")?.path(&root))?;
+            }
+            Err(error) => {
+                eprintln!("plan load failed: {error:#}");
+                let placeholder = Arc::new(Plan::parse("version = 1")?);
+                let mut state = databases.restore(placeholder)?;
+                for effect in Event::PlanLoadFailed.reduce(&mut state) {
+                    match effect {
+                        Effect::PersistHostTasks { tasks } => {
+                            databases.persist_host_tasks(&tasks)?;
+                        }
+                        Effect::PersistTask { artifact, task } => {
+                            databases.persist_task(&artifact, task.as_ref())?;
+                        }
+                        _ => {}
+                    }
+                }
+                wait_for_artifact_generation(&root, "system-plan", attempted_generation).await?;
+                attempted_generation =
+                    artifact_timestamp(&ArtifactName::parse("system-plan")?.path(&root))?;
+            }
+        }
+    }
+}
+
+async fn run_generation(root: PathBuf, plan: Arc<Plan>, databases: Databases) -> Result<bool> {
     let mut state = databases.restore(plan.clone())?;
     let (event_tx, mut event_rx) = mpsc::channel::<Event>(256);
     let (backend_tx, backend_rx) = mpsc::channel(8);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let backend_url = Arc::new(format!(
-        "http://{}:{}",
-        plan.backend.hostname, plan.backend.port
-    ));
+    let (reload_tx, mut reload_rx) = watch::channel(false);
+    let config = Config::load(&root)?;
+    let backend_url = Arc::new(format!("http://{}:{}", plan.backend.hostname, config.port));
     let client = Client::builder()
         .timeout(Duration::from_secs(30 * 60))
         .build()?;
@@ -59,19 +102,21 @@ pub async fn run(root: PathBuf) -> Result<()> {
         event_tx: event_tx.clone(),
         backend_tx: backend_tx.clone(),
         shutdown_tx: shutdown_tx.clone(),
+        reload_tx,
     });
 
     let backend_handle = spawn_backend_manager(
-        root.clone(),
-        plan.backend.clone(),
+        BackendManagerContext {
+            root: root.clone(),
+            backend: plan.backend.clone(),
+            port: config.port,
+            client: client.clone(),
+            url: backend_url.clone(),
+            event_tx: event_tx.clone(),
+        },
         backend_rx,
         shutdown_rx.clone(),
     );
-    if let Err(error) = wait_for_backend(&client, &backend_url).await {
-        let _ = backend_tx.send(BackendCommand::Stop).await;
-        let _ = backend_handle.await;
-        return Err(error);
-    }
     let watcher_handle =
         spawn_artifact_watcher(root.clone(), event_tx.clone(), shutdown_rx.clone())?;
     let timeline_handle = spawn_timeline_collector(
@@ -89,6 +134,8 @@ pub async fn run(root: PathBuf) -> Result<()> {
         .map_err(|_| anyhow!("event loop stopped"))?;
 
     let mut signal_shutdown = shutdown_rx.clone();
+    let mut process_signal = Box::pin(shutdown_signal());
+    let mut reload = false;
     loop {
         tokio::select! {
             event = event_rx.recv() => {
@@ -107,7 +154,13 @@ pub async fn run(root: PathBuf) -> Result<()> {
                     break;
                 }
             }
-            signal = tokio::signal::ctrl_c() => {
+            changed = reload_rx.changed() => {
+                if changed.is_err() || *reload_rx.borrow() {
+                    reload = true;
+                    break;
+                }
+            }
+            signal = &mut process_signal => {
                 signal?;
                 break;
             }
@@ -119,7 +172,39 @@ pub async fn run(root: PathBuf) -> Result<()> {
     watcher_handle.abort();
     timeline_handle.abort();
     let _ = backend_handle.await;
+    Ok(reload)
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => signal?,
+        _ = terminate.recv() => {},
+    }
     Ok(())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<()> {
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
+async fn wait_for_artifact_generation(
+    root: &Path,
+    name: &str,
+    previous: Option<Timestamp>,
+) -> Result<()> {
+    let artifact = ArtifactName::parse(name)?;
+    loop {
+        if artifact_timestamp(&artifact.path(root))? != previous {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn is_persistence(effect: &Effect) -> bool {
@@ -130,6 +215,7 @@ fn is_persistence(effect: &Effect) -> bool {
             | Effect::PersistObserverSession { .. }
             | Effect::PersistSession { .. }
             | Effect::PersistTask { .. }
+            | Effect::PersistHostTasks { .. }
     )
 }
 
@@ -219,6 +305,7 @@ impl Effect {
             Effect::PersistTask { artifact, task } => {
                 context.databases.persist_task(&artifact, task.as_ref())
             }
+            Effect::PersistHostTasks { tasks } => context.databases.persist_host_tasks(&tasks),
             Effect::CreateObserverSession => {
                 let response = context
                     .client
@@ -361,9 +448,9 @@ impl Effect {
                 artifact,
                 request_id: _,
             } => publish(&context.root, &artifact),
-            Effect::RestartBackend => context
+            Effect::SetBackend { generation } => context
                 .backend_tx
-                .send(BackendCommand::Restart)
+                .send(BackendCommand::Set(generation))
                 .await
                 .map_err(|_| anyhow!("backend manager stopped")),
             Effect::ExitSupervisor => {
@@ -373,45 +460,98 @@ impl Effect {
                     .map_err(|_| anyhow!("supervisor already stopped"))?;
                 Ok(())
             }
+            Effect::ReloadPlan => {
+                context
+                    .reload_tx
+                    .send(true)
+                    .map_err(|_| anyhow!("supervisor already stopped"))?;
+                Ok(())
+            }
         }
     }
 }
 
 fn spawn_backend_manager(
-    root: PathBuf,
-    backend: Backend,
+    context: BackendManagerContext,
     mut commands: mpsc::Receiver<BackendCommand>,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
-        let mut child = start_backend(&root, &backend)?;
+        let mut child: Option<Child> = None;
+        let mut desired = None;
+        let mut retry = tokio::time::interval(Duration::from_secs(1));
+        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 command = commands.recv() => match command {
-                    Some(BackendCommand::Restart) => {
-                        stop_child(&mut child).await;
-                        child = start_backend(&root, &backend)?;
+                    Some(BackendCommand::Set(generation)) => {
+                        desired = generation;
+                        if let Some(process) = &mut child {
+                            stop_child(process).await;
+                        }
+                        child = None;
+                        if let Some(generation) = generation {
+                            match start_backend(&context.root, &context.backend, context.port) {
+                                Ok(process) => {
+                                    child = Some(process);
+                                    spawn_backend_health_check(&context, generation);
+                                }
+                                Err(error) => eprintln!("failed to start OpenCode backend: {error:#}"),
+                            }
+                        }
                     }
                     Some(BackendCommand::Stop) | None => break,
                 },
+                _ = retry.tick() => {
+                    let exited = child
+                        .as_mut()
+                        .map(|process| process.try_wait())
+                        .transpose()?
+                        .flatten();
+                    if let Some(status) = exited {
+                        child = None;
+                        eprintln!("OpenCode backend exited with {status}; restarting");
+                    }
+                    if child.is_none()
+                        && let Some(generation) = desired
+                    {
+                        match start_backend(&context.root, &context.backend, context.port) {
+                            Ok(process) => {
+                                child = Some(process);
+                                spawn_backend_health_check(&context, generation);
+                            }
+                            Err(error) => {
+                                eprintln!("failed to start OpenCode backend: {error:#}");
+                            }
+                        }
+                    }
+                }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() { break; }
                 }
-                status = child.wait() => {
-                    let status = status?;
-                    if *shutdown.borrow() { break; }
-                    eprintln!("OpenCode backend exited with {status}; restarting");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    child = start_backend(&root, &backend)?;
-                }
             }
         }
-        stop_child(&mut child).await;
+        if let Some(process) = &mut child {
+            stop_child(process).await;
+        }
         Ok(())
     })
 }
 
-fn start_backend(root: &Path, backend: &Backend) -> Result<Child> {
+fn spawn_backend_health_check(context: &BackendManagerContext, generation: Timestamp) {
+    let client = context.client.clone();
+    let url = context.url.clone();
+    let event_tx = context.event_tx.clone();
+    tokio::spawn(async move {
+        if wait_for_backend(&client, &url).await.is_ok() {
+            let _ = event_tx.send(Event::BackendReady { generation }).await;
+        } else {
+            eprintln!("OpenCode backend did not become healthy");
+        }
+    });
+}
+
+fn start_backend(root: &Path, backend: &Backend, port: u16) -> Result<Child> {
     let (program, arguments) = backend
         .command
         .split_first()
@@ -422,7 +562,7 @@ fn start_backend(root: &Path, backend: &Backend) -> Result<Child> {
         .arg("--hostname")
         .arg(&backend.hostname)
         .arg("--port")
-        .arg(backend.port.to_string())
+        .arg(port.to_string())
         .current_dir(root)
         .kill_on_drop(true);
     command.spawn().with_context(|| {
@@ -486,7 +626,7 @@ fn spawn_artifact_watcher(
                         continue;
                     };
                     let Ok(name) = ArtifactName::parse(name) else { continue };
-                    let modified = observed_timestamp(&name.path(&root)).ok().flatten();
+                    let modified = artifact_timestamp(&name.path(&root)).ok().flatten();
                     if event_tx.send(Event::ArtifactObserved { name, modified }).await.is_err() {
                         break;
                     }
@@ -511,11 +651,16 @@ async fn scan_artifacts(root: &Path, event_tx: &mpsc::Sender<Event>) -> Result<(
             names.insert(name);
         }
     }
-    for built_in in ["system-active", "system-supervisor", "system-backend"] {
+    for built_in in [
+        "system-active",
+        "system-supervisor",
+        "system-backend",
+        "system-plan",
+    ] {
         names.insert(ArtifactName::parse(built_in).expect("built-in name"));
     }
     for name in names {
-        let modified = observed_timestamp(&name.path(root))?;
+        let modified = artifact_timestamp(&name.path(root))?;
         event_tx
             .send(Event::ArtifactObserved { name, modified })
             .await
@@ -524,7 +669,7 @@ async fn scan_artifacts(root: &Path, event_tx: &mpsc::Sender<Event>) -> Result<(
     Ok(())
 }
 
-fn observed_timestamp(path: &Path) -> Result<Option<Timestamp>> {
+pub(crate) fn artifact_timestamp(path: &Path) -> Result<Option<Timestamp>> {
     match std::fs::metadata(path) {
         Ok(metadata) => Ok(Some(system_time_micros(metadata.modified()?))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),

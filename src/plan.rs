@@ -22,7 +22,6 @@ pub struct Plan {
 pub struct Backend {
     pub command: Vec<String>,
     pub hostname: String,
-    pub port: u16,
 }
 
 impl Default for Backend {
@@ -30,7 +29,6 @@ impl Default for Backend {
         Self {
             command: vec!["opencode".into(), "serve".into()],
             hostname: "127.0.0.1".into(),
-            port: 4096,
         }
     }
 }
@@ -157,9 +155,6 @@ impl Plan {
         if raw.backend.hostname.is_empty() {
             bail!("backend hostname cannot be empty");
         }
-        if raw.backend.port == 0 {
-            bail!("backend port must be non-zero");
-        }
 
         for role in raw.roles.keys() {
             validate_part(role).with_context(|| format!("invalid role `{role}`"))?;
@@ -261,7 +256,11 @@ fn validate_dependencies(
             }
             let built_in = matches!(
                 dependency.name.as_str(),
-                "system-active" | "system-supervisor" | "system-backend" | "_blocked"
+                "system-active"
+                    | "system-supervisor"
+                    | "system-backend"
+                    | "system-plan"
+                    | "_blocked"
             ) || dependency
                 .name
                 .as_str()
@@ -314,7 +313,6 @@ pub const EXAMPLE_PLAN: &str = r#"version = 1
 [backend]
 command = ["opencode", "serve"]
 hostname = "127.0.0.1"
-port = 4096
 
 [roles.researcher]
 kind = "lab-worker"

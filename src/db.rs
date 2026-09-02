@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 use crate::artifact::ArtifactName;
 use crate::domain::{Session, State, Task, Timestamp};
@@ -10,6 +11,12 @@ use crate::plan::Plan;
 
 pub const STATES_DB: &str = ".labflow/states.sqlite";
 pub const TIMELINE_DB: &str = ".labflow/timeline.sqlite";
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HostTasks {
+    pub tasks: Vec<ArtifactName>,
+    pub opt: Vec<ArtifactName>,
+}
 
 #[derive(Clone, Debug)]
 pub struct Databases {
@@ -46,6 +53,10 @@ impl Databases {
             );
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS host_tasks (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 value TEXT NOT NULL
             );
             ",
@@ -105,7 +116,9 @@ impl Databases {
             })?;
             for row in rows {
                 let (role, value) = row?;
-                state.sessions.insert(role, serde_json::from_str(&value)?);
+                if state.plan.roles.contains_key(&role) {
+                    state.sessions.insert(role, serde_json::from_str(&value)?);
+                }
             }
         }
         {
@@ -115,10 +128,10 @@ impl Databases {
             })?;
             for row in rows {
                 let (artifact, value) = row?;
-                state.tasks.insert(
-                    ArtifactName::parse(&artifact)?,
-                    serde_json::from_str(&value)?,
-                );
+                let artifact = ArtifactName::parse(&artifact)?;
+                if state.plan.artifacts.contains_key(&artifact) {
+                    state.tasks.insert(artifact, serde_json::from_str(&value)?);
+                }
             }
         }
         state.next_request_id = connection
@@ -137,6 +150,16 @@ impl Databases {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
+        state.host_tasks = connection
+            .query_row(
+                "SELECT value FROM host_tasks WHERE singleton = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?
+            .unwrap_or_default();
         Ok(state)
     }
 
@@ -204,6 +227,15 @@ impl Databases {
         Ok(())
     }
 
+    pub fn persist_host_tasks(&self, tasks: &HostTasks) -> Result<()> {
+        Connection::open(&self.states)?.execute(
+            "INSERT INTO host_tasks(singleton, value) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET value = excluded.value",
+            params![serde_json::to_string(tasks)?],
+        )?;
+        Ok(())
+    }
+
     pub fn append_timeline(
         &self,
         observed_at: Timestamp,
@@ -219,6 +251,23 @@ impl Databases {
             )?;
         Ok(())
     }
+}
+
+pub fn read_host_tasks(root: &Path) -> Result<HostTasks> {
+    let path = root.join(STATES_DB);
+    if !path.is_file() {
+        return Ok(HostTasks::default());
+    }
+    let value = Connection::open(path)?
+        .query_row(
+            "SELECT value FROM host_tasks WHERE singleton = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    value
+        .map(|value| serde_json::from_str(&value).map_err(Into::into))
+        .unwrap_or_else(|| Ok(HostTasks::default()))
 }
 
 pub fn read_virtual_timestamp(root: &Path, name: &ArtifactName) -> Result<Option<Timestamp>> {
@@ -257,5 +306,11 @@ mod tests {
             read_virtual_timestamp(directory.path(), &blocked).unwrap(),
             Some(43)
         );
+        let host_tasks = HostTasks {
+            tasks: vec![artifact],
+            opt: Vec::new(),
+        };
+        databases.persist_host_tasks(&host_tasks).unwrap();
+        assert_eq!(read_host_tasks(directory.path()).unwrap(), host_tasks);
     }
 }

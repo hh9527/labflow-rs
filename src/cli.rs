@@ -1,11 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::artifact::{ARTIFACTS_DIR, ArtifactName, publish, unpublish};
-use crate::db::read_virtual_timestamp;
+use crate::config::{CONFIG_FILE, Config};
+use crate::db::{read_host_tasks, read_virtual_timestamp};
 use crate::plan::{EXAMPLE_PLAN, PLAN_FILE, Plan};
 
 #[derive(Debug, Parser)]
@@ -19,12 +21,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Init,
-    Publish {
-        artifact: ArtifactName,
+    Init {
+        #[arg(long)]
+        port: u16,
     },
-    Unpublish {
-        artifact: ArtifactName,
+    Publish {
+        #[arg(required = true, allow_hyphen_values = true)]
+        artifacts: Vec<String>,
     },
     Status {
         artifact: Option<ArtifactName>,
@@ -34,6 +37,11 @@ enum Command {
         command: PlanCommand,
     },
     Supervisor,
+    Run,
+    HostTasks {
+        #[arg(long, value_name = "SECONDS")]
+        poll: Option<u64>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -45,24 +53,8 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let root = normalize_root(&cli.root)?;
     match cli.command {
-        Command::Init => init(&root),
-        Command::Publish { artifact } => {
-            publish(&root, &artifact)?;
-            println!("published {artifact}");
-            Ok(())
-        }
-        Command::Unpublish { artifact } => {
-            let removed = unpublish(&root, &artifact)?;
-            println!(
-                "{} {artifact}",
-                if removed {
-                    "unpublished"
-                } else {
-                    "not published"
-                }
-            );
-            Ok(())
-        }
+        Command::Init { port } => init(&root, port),
+        Command::Publish { artifacts } => publish_many(&root, &artifacts),
         Command::Status { artifact } => status(&root, artifact.as_ref()),
         Command::Plan {
             command: PlanCommand::Check,
@@ -76,6 +68,8 @@ pub async fn run() -> Result<()> {
             Ok(())
         }
         Command::Supervisor => crate::runtime::run(root).await,
+        Command::Run => crate::runner::run(root).await,
+        Command::HostTasks { poll } => host_tasks(&root, poll).await,
     }
 }
 
@@ -87,7 +81,10 @@ fn normalize_root(root: &Path) -> Result<PathBuf> {
     }
 }
 
-fn init(root: &Path) -> Result<()> {
+fn init(root: &Path, port: u16) -> Result<()> {
+    if port == 0 {
+        bail!("port must be non-zero");
+    }
     fs::create_dir_all(root.join(ARTIFACTS_DIR))?;
     let plan_path = root.join(PLAN_FILE);
     if plan_path.exists() {
@@ -98,14 +95,55 @@ fn init(root: &Path) -> Result<()> {
     if !goal.exists() {
         fs::write(&goal, "# 实验目标\n")?;
     }
-    let script = root.join(".labflow/run-supervisor");
+    let config = root.join(CONFIG_FILE);
+    fs::write(&config, toml::to_string(&Config { port })?)?;
+    let script = root.join(".labflow/run");
     fs::write(
         &script,
-        "#!/bin/sh\nwhile true; do\n  labflow supervisor --root \"$(pwd)\"\n  sleep 1\ndone\n",
+        "#!/bin/sh\nset -eu\nROOT=$(CDPATH= cd -- \"$(dirname -- \"$0\")/..\" && pwd)\nexec labflow --root \"$ROOT\" run\n",
     )?;
     set_executable(&script)?;
     println!("initialized {}", root.display());
     Ok(())
+}
+
+fn publish_many(root: &Path, operations: &[String]) -> Result<()> {
+    for operation in operations {
+        if let Some(raw_name) = operation.strip_prefix('!') {
+            if raw_name.is_empty() {
+                bail!("missing artifact name after `!`");
+            }
+            let artifact = ArtifactName::parse(raw_name)?;
+            let removed = unpublish(root, &artifact)?;
+            println!(
+                "{} {artifact}",
+                if removed {
+                    "unpublished"
+                } else {
+                    "not published"
+                }
+            );
+        } else {
+            let artifact = ArtifactName::parse(operation)?;
+            publish(root, &artifact)?;
+            println!("published {artifact}");
+        }
+    }
+    Ok(())
+}
+
+async fn host_tasks(root: &Path, poll: Option<u64>) -> Result<()> {
+    let deadline = poll.map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
+    loop {
+        let tasks = read_host_tasks(root)?;
+        if !tasks.tasks.is_empty()
+            || deadline.is_none_or(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            println!("{}", serde_json::to_string(&tasks)?);
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[cfg(unix)]
@@ -130,6 +168,17 @@ fn status(root: &Path, filter: Option<&ArtifactName>) -> Result<()> {
             .artifacts
             .keys()
             .cloned()
+            .chain(
+                [
+                    "system-active",
+                    "system-supervisor",
+                    "system-backend",
+                    "system-plan",
+                ]
+                .into_iter()
+                .map(ArtifactName::parse)
+                .collect::<Result<Vec<_>>>()?,
+            )
             .chain(std::iter::once(ArtifactName::parse("_blocked")?))
             .chain(
                 plan.roles
@@ -137,6 +186,8 @@ fn status(root: &Path, filter: Option<&ArtifactName>) -> Result<()> {
                     .map(|role| ArtifactName::parse(&format!("_ready.{role}")))
                     .collect::<Result<Vec<_>>>()?,
             )
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect(),
     };
     for name in names {

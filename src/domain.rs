@@ -4,6 +4,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::artifact::ArtifactName;
+use crate::db::HostTasks;
 use crate::plan::Plan;
 
 pub type Timestamp = i64;
@@ -17,8 +18,12 @@ pub struct State {
     pub sessions: BTreeMap<String, Session>,
     pub tasks: BTreeMap<ArtifactName, Task>,
     pub backend_generation: Option<Option<Timestamp>>,
+    pub backend_ready: bool,
     pub supervisor_generation: Option<Option<Timestamp>>,
+    pub plan_generation: Option<Option<Timestamp>>,
+    pub plan_error: bool,
     pub next_request_id: u64,
+    pub host_tasks: HostTasks,
 }
 
 impl State {
@@ -37,8 +42,12 @@ impl State {
             sessions: BTreeMap::new(),
             tasks: BTreeMap::new(),
             backend_generation: None,
+            backend_ready: false,
             supervisor_generation: None,
+            plan_generation: None,
+            plan_error: false,
             next_request_id: 1,
+            host_tasks: HostTasks::default(),
         }
     }
 
@@ -121,9 +130,13 @@ impl TaskAnswer {
 #[derive(Clone, Debug)]
 pub enum Event {
     SupervisorStarted,
+    PlanLoadFailed,
     ArtifactObserved {
         name: ArtifactName,
         modified: Option<Timestamp>,
+    },
+    BackendReady {
+        generation: Timestamp,
     },
     ObserverSessionCreated {
         session_id: String,
@@ -191,6 +204,9 @@ pub enum Effect {
         artifact: ArtifactName,
         task: Option<Task>,
     },
+    PersistHostTasks {
+        tasks: HostTasks,
+    },
     CreateObserverSession,
     CreateSession {
         role: String,
@@ -217,7 +233,10 @@ pub enum Effect {
         artifact: ArtifactName,
         request_id: u64,
     },
-    RestartBackend,
+    SetBackend {
+        generation: Option<Timestamp>,
+    },
+    ReloadPlan,
     ExitSupervisor,
 }
 
@@ -225,8 +244,18 @@ impl Event {
     pub fn reduce(self, state: &mut State) -> Vec<Effect> {
         let mut effects = match self {
             Event::SupervisorStarted => reduce_supervisor_started(state),
+            Event::PlanLoadFailed => {
+                state.plan_error = true;
+                Vec::new()
+            }
             Event::ArtifactObserved { name, modified } => {
                 reduce_artifact_observed(state, name, modified)
+            }
+            Event::BackendReady { generation } => {
+                if state.backend_generation == Some(Some(generation)) {
+                    state.backend_ready = true;
+                }
+                Vec::new()
             }
             Event::ObserverSessionCreated { session_id } => {
                 reduce_observer_created(state, session_id)
@@ -289,7 +318,17 @@ impl Event {
                 .filter(|artifact| current_task(state, artifact, request_id).is_some())
                 .map_or_else(Vec::new, |artifact| fail_task(state, artifact, reason)),
         };
-        effects.extend(schedule(state));
+        if !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ReloadPlan | Effect::ExitSupervisor))
+        {
+            effects.extend(schedule(state));
+        }
+        let host_tasks = compute_host_tasks(state);
+        if host_tasks != state.host_tasks {
+            state.host_tasks = host_tasks.clone();
+            effects.push(Effect::PersistHostTasks { tasks: host_tasks });
+        }
         effects
     }
 }
@@ -453,22 +492,27 @@ fn reduce_artifact_observed(
 
     match name.as_str() {
         "system-backend" => {
-            if state.backend_generation.is_some()
-                && modified.is_some()
-                && state.backend_generation != Some(modified)
-            {
-                effects.push(Effect::RestartBackend);
+            if state.backend_generation != Some(modified) {
+                state.backend_ready = false;
+                effects.push(Effect::SetBackend {
+                    generation: modified,
+                });
             }
             state.backend_generation = Some(modified);
         }
         "system-supervisor" => {
             if state.supervisor_generation.is_some()
-                && modified.is_some()
                 && state.supervisor_generation != Some(modified)
             {
                 effects.push(Effect::ExitSupervisor);
             }
             state.supervisor_generation = Some(modified);
+        }
+        "system-plan" => {
+            if state.plan_generation.is_some() && state.plan_generation != Some(modified) {
+                effects.push(Effect::ReloadPlan);
+            }
+            state.plan_generation = Some(modified);
         }
         _ => {}
     }
@@ -708,7 +752,7 @@ fn block_task(
 }
 
 fn schedule(state: &mut State) -> Vec<Effect> {
-    if !state.is_active() {
+    if !state.is_active() || !state.backend_ready {
         return Vec::new();
     }
     let candidates: Vec<_> = state
@@ -793,6 +837,48 @@ fn schedule(state: &mut State) -> Vec<Effect> {
     effects
 }
 
+fn compute_host_tasks(state: &State) -> HostTasks {
+    let mut required = BTreeSet::new();
+    let mut optional = BTreeSet::new();
+    if state.plan_error {
+        required.insert(ArtifactName::parse("system-plan").expect("built-in name"));
+    }
+    for (name, artifact) in &state.plan.artifacts {
+        if name.role().is_none() {
+            continue;
+        }
+        let output = state.timestamp(name);
+        let stale = output.is_none()
+            || artifact.dependencies.iter().any(|dependency| {
+                state
+                    .timestamp(&dependency.name)
+                    .is_some_and(|input| output.is_none_or(|output| input > output))
+            });
+        if !stale {
+            continue;
+        }
+        for dependency in &artifact.dependencies {
+            let active_decision = dependency.name.as_str() == "system-active" && !state.is_active();
+            if dependency.name.role().is_some()
+                || dependency.name.is_supervisor()
+                || (state.timestamp(&dependency.name).is_some() && !active_decision)
+            {
+                continue;
+            }
+            if dependency.optional {
+                optional.insert(dependency.name.clone());
+            } else {
+                required.insert(dependency.name.clone());
+            }
+        }
+    }
+    optional.retain(|name| !required.contains(name));
+    HostTasks {
+        tasks: required.into_iter().collect(),
+        opt: optional.into_iter().collect(),
+    }
+}
+
 fn current_task<'a>(
     state: &'a State,
     artifact: &ArtifactName,
@@ -821,7 +907,10 @@ mod tests {
     use crate::plan::EXAMPLE_PLAN;
 
     fn state() -> State {
-        State::new(Arc::new(Plan::parse(EXAMPLE_PLAN).unwrap()))
+        let mut state = State::new(Arc::new(Plan::parse(EXAMPLE_PLAN).unwrap()));
+        state.backend_generation = Some(Some(1));
+        state.backend_ready = true;
+        state
     }
 
     fn observed(name: &str, modified: Timestamp) -> Event {
@@ -878,6 +967,12 @@ mod tests {
                 .contains_key(&ArtifactName::parse("_blocked").unwrap())
         );
         assert!(!state.is_active());
+        assert!(
+            state
+                .host_tasks
+                .tasks
+                .contains(&ArtifactName::parse("system-active").unwrap())
+        );
 
         let effects = observed("system-active", 10).reduce(&mut state);
         assert!(state.is_active());
@@ -885,6 +980,41 @@ mod tests {
             effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::PrepareTask { .. }))
+        );
+    }
+
+    #[test]
+    fn exposes_required_and_optional_host_decisions() {
+        let plan = Plan::parse(
+            r#"
+version = 1
+[roles.r]
+kind = "lab-worker"
+[artifacts.request]
+[artifacts.feedback]
+[artifacts."answer.r"]
+goal = "goal.md"
+depends-on = ["request", "feedback?"]
+"#,
+        )
+        .unwrap();
+        let mut state = State::new(Arc::new(plan));
+        state.backend_ready = true;
+        Event::SupervisorStarted.reduce(&mut state);
+        assert_eq!(
+            state.host_tasks.tasks,
+            vec![ArtifactName::parse("request").unwrap()]
+        );
+        assert_eq!(
+            state.host_tasks.opt,
+            vec![ArtifactName::parse("feedback").unwrap()]
+        );
+
+        observed("request", 2).reduce(&mut state);
+        assert!(state.host_tasks.tasks.is_empty());
+        assert_eq!(
+            state.host_tasks.opt,
+            vec![ArtifactName::parse("feedback").unwrap()]
         );
     }
 

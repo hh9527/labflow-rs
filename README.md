@@ -14,28 +14,30 @@ cargo build --release
 ## 初始化与控制
 
 ```sh
-labflow init
+labflow init --port 4096
 labflow plan check
-labflow publish query-request
-labflow publish system-active
+labflow publish system-supervisor system-backend system-active query-request
+labflow publish '!query-request'
+labflow host-tasks --poll 60
 labflow status
-labflow unpublish query-request
 ```
 
 启动 wrapper：
 
 ```sh
-.labflow/run-supervisor
+.labflow/run
 ```
 
-或者直接运行一次 supervisor：
+`.labflow/run` 持有 supervisor，supervisor 持有 OpenCode backend。也可以直接
+运行一次 supervisor：
 
 ```sh
 labflow supervisor
 ```
 
-`system-supervisor` 用于请求 wrapper 重启 supervisor，`system-backend` 用于
-请求 supervisor 重启 OpenCode 无头服务器子进程。
+`system-supervisor` 和 `system-backend` 的创建、touch、删除分别控制对应进程
+的启动、重启和停止。修改计划后 publish `system-plan` 才会使新计划生效；
+加载失败时 `host-tasks` 会请求 Host 再次 publish `system-plan`。
 
 ## 计划示例
 
@@ -45,7 +47,6 @@ version = 1
 [backend]
 command = ["opencode", "serve"]
 hostname = "127.0.0.1"
-port = 4096
 
 [roles.researcher]
 kind = "lab-worker"
@@ -61,6 +62,6 @@ assets = ["answer.md"]
 check = ["answer.md"]
 ```
 
-artifact 的角色始终是后缀，例如 `answer.researcher`。Host 可以 publish 或
-unpublish 任意非 `_` artifact；`_ready.researcher`、`_blocked` 等名称仅由
-supervisor 控制。
+artifact 的角色始终是后缀，例如 `answer.researcher`。Host 可以通过 publish
+普通名称或 `!名称` 操作任意非 `_` artifact；`_ready.researcher`、`_blocked`
+等名称仅由 supervisor 控制。
