@@ -230,7 +230,7 @@ check = ["answer.md"]
     wait_until(Duration::from_secs(10), || {
         Connection::open(directory.path().join(".labflow/timeline.sqlite"))
             .and_then(|connection| {
-                connection.query_row("SELECT count(*) FROM records", [], |row| {
+                connection.query_row("SELECT count(*) FROM artifact_turn", [], |row| {
                     row.get::<_, i64>(0)
                 })
             })
@@ -271,9 +271,55 @@ check = ["answer.md"]
     }
     let timeline = Connection::open(directory.path().join(".labflow/timeline.sqlite")).unwrap();
     let records: i64 = timeline
-        .query_row("SELECT count(*) FROM records", [], |row| row.get(0))
+        .query_row("SELECT count(*) FROM artifact_turn", [], |row| row.get(0))
         .unwrap();
     assert!(records > 0);
+    let turn: (String, i64, String, String, String) = timeline
+        .query_row(
+            "SELECT artifact, iteration, result, reply_prefix, upstream_turn_id FROM artifact_turn",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        turn,
+        (
+            "answer.researcher".into(),
+            1,
+            "succeeded".into(),
+            "完成任务。".into(),
+            "msg_fake".into(),
+        )
+    );
+    let actions = timeline
+        .prepare("SELECT kind, subject, result FROM turn_action ORDER BY action_index")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        actions,
+        vec![
+            ("reasoning".into(), None, "succeeded".into()),
+            ("read".into(), Some("goal.md".into()), "succeeded".into()),
+            ("text".into(), None, "succeeded".into()),
+        ]
+    );
 }
 
 #[test]
@@ -433,19 +479,20 @@ commands = ["just verify"]
     let records = Connection::open(directory.path().join("bench/results.sqlite")).unwrap();
     assert_eq!(
         records
-            .query_row("SELECT status FROM bench_rounds", [], |row| row
+            .query_row("SELECT status FROM bench_round", [], |row| row
                 .get::<_, String>(0))
             .unwrap(),
         "committed"
     );
     let turns = records
-        .prepare("SELECT speaker, kind, content FROM question_turns ORDER BY ordinal")
+        .prepare("SELECT turn_index, is_last_turn, q, a FROM turn ORDER BY turn_index")
         .unwrap()
         .query_map([], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
+                row.get::<_, i64>(0)?,
+                row.get::<_, bool>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })
         .unwrap()
@@ -454,20 +501,27 @@ commands = ["just verify"]
     assert_eq!(
         turns,
         vec![
-            ("C".into(), "question".into(), "solve it".into()),
-            ("R".into(), "answer".into(), "respondent reply".into()),
+            (0, false, "solve it".into(), "respondent reply".into()),
             (
-                "C".into(),
-                "clarification".into(),
-                "use the public rule".into()
-            ),
-            (
-                "R".into(),
-                "clarification-answer".into(),
+                1,
+                true,
+                "use the public rule".into(),
                 "respondent reply".into()
             ),
         ]
     );
+    let action_count: i64 = records
+        .query_row("SELECT count(*) FROM action", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(action_count, 6);
+    let command: String = records
+        .query_row(
+            "SELECT subject FROM action WHERE kind = 'bash' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(command, "just verify");
     backend.kill().unwrap();
     backend.wait().unwrap();
 }

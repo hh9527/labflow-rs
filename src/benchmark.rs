@@ -9,9 +9,11 @@ use fs2::FileExt;
 use reqwest::Client;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::config::Config;
-use crate::plan::{AssetPath, Benchmark, Plan};
+use crate::plan::{AssetPath, Benchmark, PLAN_FILE, Plan};
 
 #[derive(Clone, Debug)]
 pub enum Command {
@@ -39,6 +41,15 @@ struct Round {
     questions: Vec<Question>,
 }
 
+#[derive(Clone, Debug)]
+struct BenchAction {
+    kind: String,
+    subject: Option<String>,
+    started_at: i64,
+    finished_at: Option<i64>,
+    result: Option<String>,
+}
+
 #[derive(Default)]
 struct State {
     round: Option<Round>,
@@ -61,9 +72,11 @@ enum Event {
     Answered {
         round_id: i64,
         question: Question,
-        prompt: String,
         reply: String,
         clarification: bool,
+        started_at: i64,
+        finished_at: i64,
+        actions: Vec<BenchAction>,
     },
     AnswerSaved {
         question: Question,
@@ -95,9 +108,11 @@ enum Effect {
     SaveAnswer {
         round_id: i64,
         question: Question,
-        prompt: String,
         reply: String,
         clarification: bool,
+        started_at: i64,
+        finished_at: i64,
+        actions: Vec<BenchAction>,
     },
     Archive {
         round_id: i64,
@@ -176,6 +191,29 @@ struct MessagePart {
     kind: String,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    state: Option<PartState>,
+    #[serde(default)]
+    time: Option<PartTime>,
+}
+
+#[derive(Deserialize)]
+struct PartState {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    input: Value,
+    #[serde(default)]
+    time: Option<PartTime>,
+}
+
+#[derive(Clone, Deserialize)]
+struct PartTime {
+    start: i64,
+    #[serde(default)]
+    end: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -285,15 +323,19 @@ impl Event {
             Self::Answered {
                 round_id,
                 question,
-                prompt,
                 reply,
                 clarification,
+                started_at,
+                finished_at,
+                actions,
             } => Ok(vec![Effect::SaveAnswer {
                 round_id,
                 question,
-                prompt,
                 reply,
                 clarification,
+                started_at,
+                finished_at,
+                actions,
             }]),
             Self::AnswerSaved {
                 question,
@@ -417,17 +459,26 @@ impl Effect {
             Self::CreateRound(questions) => {
                 let mut connection = Connection::open(&context.records)?;
                 let now = now()?;
+                let configuration_revision = format!(
+                    "{:x}",
+                    Sha256::digest(fs::read(context.root.join(PLAN_FILE))?)
+                );
                 let transaction = connection.transaction()?;
                 transaction.execute(
-                    "INSERT INTO bench_rounds(status, respondent, started_at) VALUES ('current', ?1, ?2)",
-                    params![context.benchmark.respondent, now],
+                    "INSERT INTO bench_round(status, respondent, started_at, configuration_revision) VALUES ('current', ?1, ?2, ?3)",
+                    params![context.benchmark.respondent, now, configuration_revision],
                 )?;
                 let round_id = transaction.last_insert_rowid();
                 for question in &questions {
                     transaction.execute(
-                        "INSERT INTO round_questions(round_id, ordinal, question_id, q, k, status, clarification_count)
-                         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0)",
-                        params![round_id, question.ordinal, question.id, question.q, question.k],
+                        "INSERT INTO question(bench_round_id, ordinal, question_id, k, status)
+                         VALUES (?1, ?2, ?3, ?4, 'pending')",
+                        params![round_id, question.ordinal, question.id, question.k],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO turn(bench_round_id, question_id, turn_index, is_last_turn, q)
+                         VALUES (?1, ?2, 0, 0, ?3)",
+                        params![round_id, question.id, question.q],
                     )?;
                 }
                 transaction.commit()?;
@@ -467,7 +518,7 @@ impl Effect {
             } => {
                 let result = Connection::open(&context.records).and_then(|connection| {
                     connection.execute(
-                    "UPDATE bench_rounds SET session_id = ?1 WHERE id = ?2 AND status = 'current'",
+                    "UPDATE bench_round SET session_id = ?1 WHERE id = ?2 AND status = 'current'",
                     params![session_id, round_id],
                 )
                 });
@@ -492,6 +543,26 @@ impl Effect {
                 prompt,
                 clarification,
             } => {
+                let started_at = now()?;
+                let mut connection = Connection::open(&context.records)?;
+                let transaction = connection.transaction()?;
+                if clarification {
+                    transaction.execute(
+                        "INSERT INTO turn(bench_round_id, question_id, turn_index, is_last_turn, q, started_at)
+                         VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+                        params![round_id, question.id, question.clarifications, prompt, started_at],
+                    )?;
+                } else {
+                    transaction.execute(
+                        "UPDATE turn SET started_at = ?1 WHERE bench_round_id = ?2 AND question_id = ?3 AND turn_index = 0",
+                        params![started_at, round_id, question.id],
+                    )?;
+                }
+                transaction.execute(
+                    "UPDATE question SET status = 'current' WHERE bench_round_id = ?1 AND question_id = ?2",
+                    params![round_id, question.id],
+                )?;
+                transaction.commit()?;
                 let response = context
                     .client
                     .post(format!(
@@ -510,6 +581,8 @@ impl Effect {
                     .await?
                     .error_for_status()?;
                 let response: MessageResponse = response.json().await?;
+                let finished_at = now()?;
+                let actions = response_actions(&response, started_at, finished_at);
                 let reply = response_text(response);
                 let mut question = question;
                 if !clarification {
@@ -518,41 +591,50 @@ impl Effect {
                 Ok(Some(Event::Answered {
                     round_id,
                     question,
-                    prompt,
                     reply,
                     clarification,
+                    started_at,
+                    finished_at,
+                    actions,
                 }))
             }
             Self::SaveAnswer {
                 round_id,
                 question,
-                prompt,
                 reply,
                 clarification,
+                started_at,
+                finished_at,
+                actions,
             } => {
                 let connection = Connection::open(&context.records)?;
                 let transaction = connection.unchecked_transaction()?;
                 if clarification {
                     transaction.execute(
-                        "UPDATE round_questions SET clarification_count = ?1 WHERE round_id = ?2 AND question_id = ?3",
-                        params![question.clarifications, round_id, question.id],
+                        "UPDATE turn SET a = ?1, finished_at = ?2
+                         WHERE bench_round_id = ?3 AND question_id = ?4 AND turn_index = ?5",
+                        params![
+                            reply,
+                            finished_at,
+                            round_id,
+                            question.id,
+                            question.clarifications
+                        ],
                     )?;
                 } else {
                     transaction.execute(
-                        "UPDATE round_questions SET status = 'current', first_reply = ?1 WHERE round_id = ?2 AND question_id = ?3",
-                        params![reply, round_id, question.id],
+                        "UPDATE turn SET a = ?1, started_at = ?2, finished_at = ?3
+                         WHERE bench_round_id = ?4 AND question_id = ?5 AND turn_index = 0",
+                        params![reply, started_at, finished_at, round_id, question.id],
                     )?;
                 }
-                transaction.execute(
-                    "INSERT INTO question_turns(round_id, question_id, ordinal, speaker, kind, content, created_at)
-                     VALUES (?1, ?2, COALESCE((SELECT max(ordinal) + 1 FROM question_turns WHERE round_id = ?1 AND question_id = ?2), 0), 'C', ?3, ?4, ?5)",
-                    params![round_id, question.id, if clarification { "clarification" } else { "question" }, prompt, now()?],
-                )?;
-                transaction.execute(
-                    "INSERT INTO question_turns(round_id, question_id, ordinal, speaker, kind, content, created_at)
-                     VALUES (?1, ?2, COALESCE((SELECT max(ordinal) + 1 FROM question_turns WHERE round_id = ?1 AND question_id = ?2), 0), 'R', ?3, ?4, ?5)",
-                    params![round_id, question.id, if clarification { "clarification-answer" } else { "answer" }, reply, now()?],
-                )?;
+                for (action_index, action) in actions.into_iter().enumerate() {
+                    transaction.execute(
+                        "INSERT INTO action(bench_round_id, question_id, turn_index, action_index, kind, subject, started_at, finished_at, result)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![round_id, question.id, question.clarifications, action_index as i64, action.kind, action.subject, action.started_at, action.finished_at, action.result],
+                    )?;
+                }
                 transaction.commit()?;
                 Ok(Some(Event::AnswerSaved {
                     question,
@@ -564,10 +646,17 @@ impl Effect {
                 round_id,
                 question_id,
             } => {
-                Connection::open(&context.records)?.execute(
-                    "UPDATE round_questions SET status = 'archived', archived_at = ?1 WHERE round_id = ?2 AND question_id = ?3 AND status = 'current'",
+                let mut connection = Connection::open(&context.records)?;
+                let transaction = connection.transaction()?;
+                transaction.execute(
+                    "UPDATE question SET status = 'archived', archived_at = ?1 WHERE bench_round_id = ?2 AND question_id = ?3 AND status = 'current'",
                     params![now()?, round_id, question_id],
                 )?;
+                transaction.execute(
+                    "UPDATE turn SET is_last_turn = 1 WHERE bench_round_id = ?1 AND question_id = ?2 AND turn_index = (SELECT max(turn_index) FROM turn WHERE bench_round_id = ?1 AND question_id = ?2)",
+                    params![round_id, question_id],
+                )?;
+                transaction.commit()?;
                 Ok(Some(Event::Archived))
             }
             Self::DeleteSession { session_id, after } => {
@@ -582,7 +671,7 @@ impl Effect {
             }
             Self::CommitRound { round_id } => {
                 Connection::open(&context.records)?.execute(
-                    "UPDATE bench_rounds SET status = 'committed', committed_at = ?1, session_id = NULL WHERE id = ?2 AND status = 'current'",
+                    "UPDATE bench_round SET status = 'committed', finished_at = ?1, session_id = NULL WHERE id = ?2 AND status = 'current'",
                     params![now()?, round_id],
                 )?;
                 Ok(Some(Event::RoundCommitted))
@@ -597,25 +686,46 @@ impl Effect {
 }
 
 fn initialize(path: &Path) -> Result<()> {
-    Connection::open(path)?.execute_batch(
+    let connection = Connection::open(path)?;
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 2 {
+        connection.execute_batch(
+            "DROP TABLE IF EXISTS question_turns;
+             DROP TABLE IF EXISTS round_questions;
+             DROP TABLE IF EXISTS bench_rounds;
+             DROP TABLE IF EXISTS action;
+             DROP TABLE IF EXISTS turn;
+             DROP TABLE IF EXISTS question;
+             DROP TABLE IF EXISTS bench_round;",
+        )?;
+    }
+    connection.execute_batch(
         "PRAGMA journal_mode = WAL;
-         CREATE TABLE IF NOT EXISTS bench_rounds (
+         CREATE TABLE IF NOT EXISTS bench_round (
            id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL,
            respondent TEXT NOT NULL, session_id TEXT, started_at INTEGER NOT NULL,
-           committed_at INTEGER
+           finished_at INTEGER, configuration_revision TEXT
          );
-         CREATE UNIQUE INDEX IF NOT EXISTS one_current_round ON bench_rounds(status) WHERE status = 'current';
-         CREATE TABLE IF NOT EXISTS round_questions (
-           round_id INTEGER NOT NULL, ordinal INTEGER NOT NULL, question_id TEXT NOT NULL,
-           q TEXT NOT NULL, k TEXT NOT NULL, status TEXT NOT NULL,
-           first_reply TEXT, clarification_count INTEGER NOT NULL, archived_at INTEGER,
-           PRIMARY KEY(round_id, question_id)
+         CREATE UNIQUE INDEX IF NOT EXISTS one_current_round ON bench_round(status) WHERE status = 'current';
+         CREATE TABLE IF NOT EXISTS question (
+           bench_round_id INTEGER NOT NULL, ordinal INTEGER NOT NULL, question_id TEXT NOT NULL,
+           k TEXT NOT NULL, status TEXT NOT NULL, archived_at INTEGER,
+           PRIMARY KEY(bench_round_id, question_id)
          );
-         CREATE TABLE IF NOT EXISTS question_turns (
-           round_id INTEGER NOT NULL, question_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
-           speaker TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL,
-           PRIMARY KEY(round_id, question_id, ordinal)
-         );",
+         CREATE TABLE IF NOT EXISTS turn (
+           bench_round_id INTEGER NOT NULL, question_id TEXT NOT NULL, turn_index INTEGER NOT NULL,
+           is_last_turn INTEGER NOT NULL, q TEXT NOT NULL, a TEXT,
+           started_at INTEGER, finished_at INTEGER,
+           PRIMARY KEY(bench_round_id, question_id, turn_index)
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS one_last_turn ON turn(bench_round_id, question_id) WHERE is_last_turn = 1;
+         CREATE TABLE IF NOT EXISTS action (
+           bench_round_id INTEGER NOT NULL, question_id TEXT NOT NULL, turn_index INTEGER NOT NULL,
+           action_index INTEGER NOT NULL, kind TEXT NOT NULL, subject TEXT,
+           started_at INTEGER NOT NULL, finished_at INTEGER, result TEXT,
+           PRIMARY KEY(bench_round_id, question_id, turn_index, action_index)
+         );
+         PRAGMA user_version = 2;",
     )?;
     Ok(())
 }
@@ -624,7 +734,7 @@ fn restore(path: &Path) -> Result<State> {
     let connection = Connection::open(path)?;
     let row = connection
         .query_row(
-            "SELECT id, session_id FROM bench_rounds WHERE status = 'current'",
+            "SELECT id, session_id FROM bench_round WHERE status = 'current'",
             [],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
         )
@@ -633,8 +743,10 @@ fn restore(path: &Path) -> Result<State> {
         return Ok(State::default());
     };
     let mut statement = connection.prepare(
-        "SELECT ordinal, question_id, q, k, status, clarification_count
-         FROM round_questions WHERE round_id = ?1 ORDER BY ordinal",
+        "SELECT qn.ordinal, qn.question_id, t.q, qn.k, qn.status,
+                COALESCE((SELECT max(turn_index) FROM turn WHERE bench_round_id = qn.bench_round_id AND question_id = qn.question_id), 0)
+         FROM question qn JOIN turn t ON t.bench_round_id = qn.bench_round_id AND t.question_id = qn.question_id AND t.turn_index = 0
+         WHERE qn.bench_round_id = ?1 ORDER BY qn.ordinal",
     )?;
     let questions = statement
         .query_map([id], |row| {
@@ -757,6 +869,74 @@ fn response_text(response: MessageResponse) -> String {
         .filter_map(|part| part.text)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn response_actions(
+    response: &MessageResponse,
+    turn_started_at: i64,
+    turn_finished_at: i64,
+) -> Vec<BenchAction> {
+    response
+        .parts
+        .iter()
+        .filter_map(|part| {
+            let raw_kind = part.tool.as_deref().unwrap_or(&part.kind);
+            let kind = match raw_kind.to_ascii_lowercase().as_str() {
+                "reasoning" => "reasoning",
+                "text" => "text",
+                "read" => "read",
+                "edit" | "apply_patch" => "edit",
+                "write" => "write",
+                "glob" => "glob",
+                "bash" => "bash",
+                _ if part.tool.is_some() || part.kind == "tool" => "other-tool",
+                _ => return None,
+            }
+            .to_owned();
+            let state = part.state.as_ref();
+            let time = state
+                .and_then(|state| state.time.as_ref())
+                .or(part.time.as_ref());
+            let subject = state.and_then(|state| action_subject(&kind, &state.input));
+            let result = state
+                .and_then(|state| state.status.as_deref())
+                .and_then(action_result);
+            let completed = state.is_none() || result.is_some();
+            Some(BenchAction {
+                kind,
+                subject,
+                started_at: time.map_or(turn_started_at, |time| time.start),
+                finished_at: time
+                    .and_then(|time| time.end)
+                    .or(completed.then_some(turn_finished_at)),
+                result: result
+                    .map(str::to_owned)
+                    .or_else(|| state.is_none().then(|| "succeeded".into())),
+            })
+        })
+        .collect()
+}
+
+fn action_subject(kind: &str, input: &Value) -> Option<String> {
+    let field = match kind {
+        "read" | "edit" | "write" => ["filePath", "path"].as_slice(),
+        "glob" => ["path", "pattern"].as_slice(),
+        "bash" => ["command"].as_slice(),
+        _ => return None,
+    };
+    field
+        .iter()
+        .find_map(|name| input.get(name).and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+fn action_result(status: &str) -> Option<&'static str> {
+    match status {
+        "completed" | "success" | "succeeded" => Some("succeeded"),
+        "error" | "failed" => Some("failed"),
+        "cancelled" | "interrupted" => Some("interrupted"),
+        _ => None,
+    }
 }
 
 fn current_round(state: &mut State) -> Result<&mut Round> {

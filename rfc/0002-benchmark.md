@@ -145,20 +145,34 @@ supervisor check 并 publish `bench-<name>`。
 
 ## Records
 
-records 是每个 benchmark 独立、持续追加的 SQLite 数据库，至少表达：
+records 是每个 benchmark 独立、持续追加的 SQLite 数据库。它是自包含的评测
+过程记录，不依赖回查 OpenCode session、message 或 event：
 
 ```text
-bench_rounds
-  id, status, session_id, started_at, committed_at,
-  plan_revision, challenger_agent, respondent_agent
+bench_round
+  id, status, respondent, session_id, started_at, finished_at,
+  configuration_revision
 
-round_questions
-  round_id, question_id, ordinal, q, k, status,
-  first_reply, clarification_count, archived_at
+question
+  bench_round_id, question_id, ordinal, k, status, archived_at
 
-question_turns
-  round_id, question_id, ordinal, speaker, kind, content, created_at
+turn
+  bench_round_id, question_id, turn_index, is_last_turn,
+  q, a, started_at, finished_at
+
+action
+  bench_round_id, question_id, turn_index, action_index,
+  kind, subject, started_at, finished_at, result
 ```
+
+一个 turn 是一次完整的 C 到 R 问答。首轮 q 是原始 Q，后续 q 是 C 实际发送
+的澄清文本；a 始终保存 R 的完整原文。K 留在 question 输入快照中，因为它
+不一定被发送给 R。archive 将当前 turn 标为 `is_last_turn`。
+
+action 的 kind 至少包括 reasoning、text、read、edit、write、glob、bash 和
+other-tool。只保存过程元数据；不保存 reasoning 内容、文件内容、命令输出或
+完整 OpenCode payload。运行中的 R session ID 仅是 current round 的恢复字段，
+finish 后清空，不作为分析溯源。
 
 每次 start 创建新 round；所有插入均携带 round ID；finish 只转正当前批次，
 永不覆盖既有 committed 数据。artifact touch file 表示该数据库新增了一批已经

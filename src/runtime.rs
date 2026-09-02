@@ -16,8 +16,8 @@ use tokio::task::JoinSet;
 
 use crate::artifact::{ARTIFACTS_DIR, ArtifactName, publish};
 use crate::config::Config;
-use crate::db::Databases;
-use crate::domain::{Effect, Event, Timestamp};
+use crate::db::{Databases, TimelineAction};
+use crate::domain::{Effect, Event, TaskAnswer, Timestamp};
 use crate::plan::{Backend, Plan};
 use crate::prompt::{build_task_prompt, check_task};
 
@@ -282,11 +282,10 @@ async fn run_generation(
     );
     let watcher_handle =
         spawn_artifact_watcher(root.clone(), event_tx.clone(), shutdown_rx.clone())?;
-    let timeline_handle = spawn_timeline_collector(
+    let event_stream_handle = spawn_opencode_event_collector(
         client,
         backend_url,
         root.clone(),
-        databases,
         event_tx.clone(),
         shutdown_rx.clone(),
     );
@@ -343,7 +342,7 @@ async fn run_generation(
     while effect_tasks.join_next().await.is_some() {}
     let _ = backend_tx.send(BackendCommand::Stop).await;
     watcher_handle.abort();
-    timeline_handle.abort();
+    event_stream_handle.abort();
     let _ = backend_handle.await;
     Ok(reload)
 }
@@ -396,6 +395,7 @@ fn is_persistence(effect: &Effect) -> bool {
             | Effect::PersistTask { .. }
             | Effect::PersistHostTasks { .. }
             | Effect::PersistNextRequest { .. }
+            | Effect::MarkTimelineTurnResult { .. }
     )
 }
 
@@ -418,11 +418,21 @@ async fn apply_effect(effect: Effect, context: Arc<EffectContext>) -> Result<()>
                 FailureTarget::Task {
                     artifact,
                     request_id,
-                } => Event::EffectFailed {
-                    artifact: Some(artifact),
-                    request_id,
-                    reason: error.to_string(),
-                },
+                } => {
+                    let _ = context.databases.finish_timeline_turn(
+                        request_id,
+                        system_time_micros(SystemTime::now()),
+                        "failed",
+                        None,
+                        None,
+                        &[],
+                    );
+                    Event::EffectFailed {
+                        artifact: Some(artifact),
+                        request_id,
+                        reason: error.to_string(),
+                    }
+                }
             };
             let _ = context.event_tx.send(event).await;
             return Ok(());
@@ -502,6 +512,9 @@ impl Effect {
             }
             Effect::PersistHostTasks { tasks } => context.databases.persist_host_tasks(&tasks),
             Effect::PersistNextRequest { next } => context.databases.persist_next_request_id(next),
+            Effect::MarkTimelineTurnResult { request_id, result } => context
+                .databases
+                .mark_timeline_turn_result(request_id, &result),
             Effect::CreateObserverSession { request_id } => {
                 let response = context
                     .client
@@ -582,7 +595,16 @@ impl Effect {
                 request_id,
                 agent_id,
                 prompt,
+                iteration,
             } => {
+                let started_at = system_time_micros(SystemTime::now());
+                context.databases.begin_timeline_turn(
+                    request_id,
+                    &artifact,
+                    iteration,
+                    started_at,
+                    &session_id,
+                )?;
                 let response = context
                     .client
                     .post(format!(
@@ -598,14 +620,21 @@ impl Effect {
                     .await?
                     .error_for_status()?;
                 let value: Value = response.json().await?;
-                let content = value["parts"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|part| part["type"] == "text")
-                    .filter_map(|part| part["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let content = response_text(&value);
+                let finished_at = system_time_micros(SystemTime::now());
+                let actions = response_actions(&value, started_at, finished_at);
+                let upstream_turn_id = value["info"]["id"].as_str();
+                context.databases.finish_timeline_turn(
+                    request_id,
+                    finished_at,
+                    match TaskAnswer::parse(&content) {
+                        TaskAnswer::Completed => "succeeded",
+                        TaskAnswer::Unable | TaskAnswer::Invalid => "failed",
+                    },
+                    Some(utf8_prefix(&content, 60)),
+                    upstream_turn_id,
+                    &actions,
+                )?;
                 context
                     .event_tx
                     .send(Event::TaskAnswered {
@@ -906,11 +935,95 @@ fn system_time_micros(time: SystemTime) -> Timestamp {
         .unwrap_or(i64::MAX)
 }
 
-fn spawn_timeline_collector(
+fn response_text(value: &Value) -> String {
+    value["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|part| part["type"] == "text")
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn response_actions(
+    value: &Value,
+    started_at: Timestamp,
+    finished_at: Timestamp,
+) -> Vec<TimelineAction> {
+    value["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|part| {
+            let source_kind = part["tool"].as_str().or_else(|| part["type"].as_str())?;
+            let kind = match source_kind.to_ascii_lowercase().as_str() {
+                "reasoning" => "reasoning",
+                "text" => "text",
+                "read" => "read",
+                "edit" | "apply_patch" => "edit",
+                "write" => "write",
+                "glob" => "glob",
+                "bash" => "bash",
+                _ if part["type"] == "tool" => "other-tool",
+                _ => return None,
+            };
+            let state = &part["state"];
+            let time = if state["time"].is_object() {
+                &state["time"]
+            } else {
+                &part["time"]
+            };
+            let status = state["status"].as_str();
+            let result = status
+                .and_then(normalize_action_result)
+                .or_else(|| (!state.is_object()).then_some("succeeded"));
+            let subject = action_subject(kind, &state["input"]);
+            Some(TimelineAction {
+                kind: kind.to_owned(),
+                subject,
+                started_at: time["start"].as_i64().unwrap_or(started_at),
+                finished_at: time["end"].as_i64().or_else(|| result.map(|_| finished_at)),
+                result: result.map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+fn action_subject(kind: &str, input: &Value) -> Option<String> {
+    let fields: &[&str] = match kind {
+        "read" | "edit" | "write" => &["filePath", "path"],
+        "glob" => &["path", "pattern"],
+        "bash" => &["command"],
+        _ => return None,
+    };
+    fields
+        .iter()
+        .find_map(|field| input[*field].as_str())
+        .map(str::to_owned)
+}
+
+fn normalize_action_result(status: &str) -> Option<&'static str> {
+    match status {
+        "completed" | "success" | "succeeded" => Some("succeeded"),
+        "error" | "failed" => Some("failed"),
+        "cancelled" | "interrupted" => Some("interrupted"),
+        _ => None,
+    }
+}
+
+fn utf8_prefix(value: &str, limit: usize) -> &str {
+    let mut end = value.len().min(limit);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn spawn_opencode_event_collector(
     client: Client,
     backend_url: Arc<String>,
     root: PathBuf,
-    databases: Databases,
     event_tx: mpsc::Sender<Event>,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -936,17 +1049,10 @@ fn spawn_timeline_collector(
                                 let frame = buffer[..end].to_owned();
                                 buffer.drain(..end + 2);
                                 for data in frame.lines().filter_map(|line| line.strip_prefix("data: ")) {
-                                    if let Ok(value) = serde_json::from_str::<Value>(data) {
-                                        let kind = value["type"].as_str().unwrap_or("unknown");
-                                        let _ = databases.append_timeline(
-                                            system_time_micros(SystemTime::now()),
-                                            "opencode-event",
-                                            kind,
-                                            &value,
-                                        );
-                                        if let Some(event) = extract_opencode_event(&value) {
-                                            let _ = event_tx.send(event).await;
-                                        }
+                                    if let Ok(value) = serde_json::from_str::<Value>(data)
+                                        && let Some(event) = extract_opencode_event(&value)
+                                    {
+                                        let _ = event_tx.send(event).await;
                                     }
                                 }
                             }
@@ -993,6 +1099,14 @@ fn extract_opencode_event(value: &Value) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reply_prefix_respects_utf8_boundary_and_byte_limit() {
+        let value = "你".repeat(30);
+        let prefix = utf8_prefix(&value, 60);
+        assert_eq!(prefix.len(), 60);
+        assert_eq!(prefix, "你".repeat(20));
+    }
 
     #[test]
     fn extracts_session_status_events() {

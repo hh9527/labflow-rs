@@ -242,6 +242,10 @@ pub enum Effect {
     PersistNextRequest {
         next: u64,
     },
+    MarkTimelineTurnResult {
+        request_id: u64,
+        result: String,
+    },
     CreateObserverSession {
         request_id: u64,
     },
@@ -262,6 +266,7 @@ pub enum Effect {
         request_id: u64,
         agent_id: String,
         prompt: String,
+        iteration: u8,
     },
     CheckTask {
         artifact: ArtifactName,
@@ -791,6 +796,7 @@ fn reduce_task_prepared(
     state.tasks.get_mut(&artifact).expect("task exists").status = TaskStatus::Running;
     state.sessions.get_mut(&role).expect("session exists").busy = true;
     let task = state.tasks[&artifact].clone();
+    let iteration = task.retries.saturating_add(1);
     let session = state.sessions[&role].clone();
     let agent_id = task.agent_id.clone();
     vec![
@@ -809,6 +815,7 @@ fn reduce_task_prepared(
             request_id,
             agent_id,
             prompt,
+            iteration,
         },
     ]
 }
@@ -889,7 +896,12 @@ fn reduce_task_checked(
             .map(|path| format!("{path} 文件不存在"))
             .collect::<Vec<_>>()
             .join("\n");
-        fail_task(state, artifact, reason)
+        let mut effects = fail_task(state, artifact, reason);
+        effects.push(Effect::MarkTimelineTurnResult {
+            request_id,
+            result: "failed".into(),
+        });
+        effects
     }
 }
 

@@ -63,7 +63,15 @@ class Handler(BaseHTTPRequestHandler):
                 output.write(json.dumps(body) + "\n")
             self.send_json({
                 "info": {"id": "msg_respondent"},
-                "parts": [{"type": "text", "text": "respondent reply"}],
+                "parts": [
+                    {"type": "reasoning", "time": {"start": 20, "end": 21}},
+                    {"type": "tool", "tool": "bash", "state": {
+                        "status": "completed",
+                        "input": {"command": "just verify"},
+                        "time": {"start": 22, "end": 23},
+                    }},
+                    {"type": "text", "text": "respondent reply"},
+                ],
             })
         elif self.path.startswith("/session/ses_worker/message?"):
             if not body.get("agent", "").startswith("researcher."):
@@ -73,7 +81,15 @@ class Handler(BaseHTTPRequestHandler):
                 output.write("fake answer\n")
             self.send_json({
                 "info": {"id": "msg_fake"},
-                "parts": [{"type": "text", "text": "完成任务。"}],
+                "parts": [
+                    {"type": "reasoning", "time": {"start": 10, "end": 11}},
+                    {"type": "tool", "tool": "read", "state": {
+                        "status": "completed",
+                        "input": {"filePath": "goal.md"},
+                        "time": {"start": 12, "end": 13},
+                    }},
+                    {"type": "text", "text": "完成任务。"},
+                ],
             })
         else:
             self.send_error(404)

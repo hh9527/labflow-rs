@@ -24,6 +24,15 @@ pub struct Databases {
     pub timeline: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+pub struct TimelineAction {
+    pub kind: String,
+    pub subject: Option<String>,
+    pub started_at: Timestamp,
+    pub finished_at: Option<Timestamp>,
+    pub result: Option<String>,
+}
+
 impl Databases {
     pub fn initialize(root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root.join(".labflow"))?;
@@ -62,18 +71,39 @@ impl Databases {
             ",
         )?;
         let timeline = Connection::open(&databases.timeline)?;
+        let version: i64 = timeline.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version != 2 {
+            timeline.execute_batch(
+                "DROP TABLE IF EXISTS records;
+                 DROP TABLE IF EXISTS artifact_turn;
+                 DROP TABLE IF EXISTS turn_action;",
+            )?;
+        }
         timeline.execute_batch(
-            "
-            PRAGMA journal_mode = WAL;
-            CREATE TABLE IF NOT EXISTS records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                observed_at INTEGER NOT NULL,
-                source TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                payload TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS records_observed_at ON records(observed_at);
-            ",
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE IF NOT EXISTS artifact_turn (
+               id INTEGER PRIMARY KEY,
+               artifact TEXT NOT NULL,
+               iteration INTEGER NOT NULL,
+               started_at INTEGER NOT NULL,
+               finished_at INTEGER,
+               result TEXT,
+               reply_prefix TEXT,
+               upstream_session_id TEXT NOT NULL,
+               upstream_turn_id TEXT
+             );
+             CREATE INDEX IF NOT EXISTS artifact_turn_artifact ON artifact_turn(artifact, iteration);
+             CREATE TABLE IF NOT EXISTS turn_action (
+               artifact_turn_id INTEGER NOT NULL,
+               action_index INTEGER NOT NULL,
+               kind TEXT NOT NULL,
+               subject TEXT,
+               started_at INTEGER NOT NULL,
+               finished_at INTEGER,
+               result TEXT,
+               PRIMARY KEY(artifact_turn_id, action_index)
+             );
+             PRAGMA user_version = 2;",
         )?;
         Ok(databases)
     }
@@ -241,19 +271,57 @@ impl Databases {
         Ok(())
     }
 
-    pub fn append_timeline(
+    pub fn begin_timeline_turn(
         &self,
-        observed_at: Timestamp,
-        source: &str,
-        kind: &str,
-        payload: &serde_json::Value,
+        id: u64,
+        artifact: &ArtifactName,
+        iteration: u8,
+        started_at: Timestamp,
+        upstream_session_id: &str,
     ) -> Result<()> {
         Connection::open(&self.timeline)
             .with_context(|| format!("failed to open `{}`", self.timeline.display()))?
             .execute(
-                "INSERT INTO records(observed_at, source, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-                params![observed_at, source, kind, serde_json::to_string(payload)?],
+                "INSERT INTO artifact_turn(id, artifact, iteration, started_at, upstream_session_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, artifact.as_str(), iteration, started_at, upstream_session_id],
             )?;
+        Ok(())
+    }
+
+    pub fn finish_timeline_turn(
+        &self,
+        id: u64,
+        finished_at: Timestamp,
+        result: &str,
+        reply_prefix: Option<&str>,
+        upstream_turn_id: Option<&str>,
+        actions: &[TimelineAction],
+    ) -> Result<()> {
+        let mut connection = Connection::open(&self.timeline)?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE artifact_turn SET finished_at = ?1, result = ?2,
+             reply_prefix = COALESCE(?3, reply_prefix), upstream_turn_id = COALESCE(?4, upstream_turn_id)
+             WHERE id = ?5",
+            params![finished_at, result, reply_prefix, upstream_turn_id, id],
+        )?;
+        for (index, action) in actions.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO turn_action(artifact_turn_id, action_index, kind, subject, started_at, finished_at, result)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, index as i64, action.kind, action.subject, action.started_at, action.finished_at, action.result],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_timeline_turn_result(&self, id: u64, result: &str) -> Result<()> {
+        Connection::open(&self.timeline)?.execute(
+            "UPDATE artifact_turn SET result = ?1 WHERE id = ?2",
+            params![result, id],
+        )?;
         Ok(())
     }
 }
