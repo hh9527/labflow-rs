@@ -6,7 +6,7 @@
 ## 摘要
 
 本 RFC 定义评测实验中的被测 Agent 协议。评测角色 C 控制题目推进，被测
-OpenCode agent R 在每轮全新会话中作答。Labflow 负责题目投递、轮次状态、
+OpenCode agent R 在每轮全新的顶层会话中作答。Labflow 负责题目投递、轮次状态、
 对话归档、结果转正和会话清理，不负责判断答案质量。
 
 ## 计划表面
@@ -87,7 +87,8 @@ questions 文件列出的全部题目快照，并创建全新的 R session。成
 {"round":"<round-id>"}
 ```
 
-同一 benchmark 同时只能存在一个 current round。
+同一 benchmark 同时只能存在一个 current round。R session 不设置 OpenCode
+`parentID`；它与 C 的归属是 records 中 current round 所表达的逻辑关系。
 
 ### 下一题
 
@@ -163,8 +164,16 @@ question_turns
 
 ## Reducer/Effect
 
-协议严格遵守 RFC 0001 的 reducer/effect 原则。CLI 只通过 supervisor 控制
-通道提交带 request ID 的意图并等待结果，不能直接读写 records 或调用 OpenCode。
+协议严格遵守 RFC 0001 的 reducer/effect 原则，但 bench CLI 运行独立的短生命
+周期 reducer runtime，不通过 supervisor 转发命令。每次 CLI 从该 benchmark
+的 records 恢复状态，把命令转换为初始 Event，并串行执行 reducer 产生的
+SQLite/HTTP Effect。CLI 命令处理代码本身不能绕过 Effect 直接修改 records
+或调用 OpenCode。
+
+R session 不进入 DAG 的 `State.sessions`，也不写 `states.sqlite`；其 session ID
+只记录在独立 records 的 current round 中。supervisor 仍只管理 C 的 DAG
+session，并通过现有 HTTP response/event 感知 C 的任务结束。R 是顶层 session，
+但必须在对应 round 转正前由 bench CLI 确认删除。
 
 reducer 是以下决策的唯一所有者：
 
