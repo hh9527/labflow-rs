@@ -16,7 +16,7 @@ cargo build --release
 ## 初始化与控制
 
 ```sh
-labflow init --port 4096
+labflow config --port 4096
 labflow plan check
 labflow publish system-supervisor system-backend system-active query-request
 labflow publish '!query-request'
@@ -30,10 +30,10 @@ labflow status
 启动 wrapper：
 
 ```sh
-.labflow/run
+.labflow/bin/run
 ```
 
-`.labflow/run` 是不依赖 Labflow 常驻进程的 Bash launcher，直接持有 supervisor
+`.labflow/bin/run` 是不依赖 Labflow 常驻进程的 Bash launcher，直接持有 supervisor
 和 OpenCode 两个子进程。也可以在已经运行 OpenCode 时直接运行一次 supervisor：
 
 ```sh

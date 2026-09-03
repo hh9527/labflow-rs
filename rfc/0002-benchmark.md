@@ -53,7 +53,8 @@ worker artifact `bench-a.b1`，其唯一输出和检查项为 `records`。
 {"id":"q1","Q":"问题一","K":"仅供 C 使用的澄清知识","R":"参考答案","tags":["reasoning"]}
 ```
 
-`Q` 必填；`K`、`R` 和 `tags` 可选。`R` 是仅供后续分析使用的参考答案，不由
+`Q` 必填；`K`、`R` 和 `tags` 可选。`K` 缺失或为 JSON `null` 都表示没有隐藏
+知识，并在轮次快照中规范化为空字符串。`R` 是仅供后续分析使用的参考答案，不由
 challenge CLI 返回，也不发送给被测 Agent。tags 必须是非空、无重复的字符串。
 
 `bench start` 将 JSONL 中的整份题集及 Q、K、R、tags 快照导入 records。后续

@@ -852,7 +852,7 @@ struct SourceQuestion {
     #[serde(rename = "Q")]
     q: String,
     #[serde(default, rename = "K")]
-    k: String,
+    k: Option<String>,
     #[serde(default, rename = "R")]
     reference_answer: Option<String>,
     #[serde(default)]
@@ -888,7 +888,7 @@ fn load_questions(context: &ContextData) -> Result<Vec<Question>> {
                 ordinal: ordinal as i64,
                 id: source.id,
                 q: source.q,
-                k: source.k,
+                k: source.k.unwrap_or_default(),
                 reference_answer: source.reference_answer,
                 tags: tags.into_iter().collect(),
                 status: "pending".into(),
@@ -1066,5 +1066,21 @@ impl Lock {
 impl Drop for Lock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SourceQuestion;
+
+    #[test]
+    fn hidden_knowledge_may_be_missing_or_null() {
+        for input in [
+            r#"{"id":"q1","Q":"question"}"#,
+            r#"{"id":"q1","Q":"question","K":null}"#,
+        ] {
+            let question: SourceQuestion = serde_json::from_str(input).unwrap();
+            assert_eq!(question.k, None);
+        }
     }
 }

@@ -62,7 +62,7 @@ commands = ["just verify"]
 
 ## 计划简化
 
-计划删除 `[backend]`。生成的 Bash `.labflow/run` 从 `.labflow/config` 读取端口，
+计划删除 `[backend]`。生成的 Bash `.labflow/bin/run` 从 `.labflow/config` 读取端口，
 并在 `127.0.0.1` 上运行 `opencode serve`；supervisor 只连接该服务并根据健康状态
 暂停或恢复调度，不拥有 OpenCode 进程。
 
@@ -157,7 +157,8 @@ printf 'SELECT * FROM question' | labflow query-bench solver -f -
 与追加保存所有历史轮次的 `.labflow/benchmarks/solver.sqlite` 相互独立。
 
 每行题目格式为 `{ id, Q, K?, R?, tags? }`。`id` 必须非空且在文件内唯一，
-`Q` 是题面，`K` 是可选澄清知识，`R` 是可选参考答案，`tags` 是默认空数组的
+`Q` 是题面，`K` 是可选澄清知识（字段缺失或为 JSON `null` 均表示没有），
+`R` 是可选参考答案，`tags` 是默认空数组的
 非空、无重复字符串集合。`bench start` 按文件行序将整份题集快照到新 round；
 参考答案不由 challenge CLI 返回，也绝不发送给被测 Agent。数据库将它保存为
 `question.reference_answer`，并将标签规范化保存到 `question_tag`，供后续分析。

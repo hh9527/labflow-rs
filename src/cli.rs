@@ -23,9 +23,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Init {
+    Config {
         #[arg(long)]
-        port: u16,
+        port: Option<u16>,
     },
     Publish {
         #[arg(required = true, allow_hyphen_values = true)]
@@ -93,7 +93,7 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let root = normalize_root(&cli.root)?;
     match cli.command {
-        Command::Init { port } => init(&root, port),
+        Command::Config { port } => configure(&root, port),
         Command::Publish { artifacts } => publish_many(&root, &artifacts),
         Command::Status { artifact } => status(&root, artifact.as_ref()),
         Command::Plan {
@@ -172,33 +172,46 @@ fn normalize_root(root: &Path) -> Result<PathBuf> {
     }
 }
 
-fn init(root: &Path, port: u16) -> Result<()> {
+const DEFAULT_PORT: u16 = 4096;
+
+fn configure(root: &Path, port: Option<u16>) -> Result<()> {
+    let config_exists = root.join(CONFIG_FILE).exists();
+    let (port, write_config) = match port {
+        Some(port) => (port, true),
+        None if config_exists => (Config::load(root)?.port, false),
+        None => (DEFAULT_PORT, true),
+    };
     if port == 0 {
         bail!("port must be non-zero");
     }
     fs::create_dir_all(root.join(ARTIFACTS_DIR))?;
+    fs::create_dir_all(root.join(".labflow/benchmarks"))?;
+    fs::create_dir_all(root.join(".labflow/locks"))?;
+    fs::create_dir_all(root.join(".labflow/opencode/agents"))?;
+    fs::create_dir_all(root.join(".labflow/bin"))?;
     let plan_path = root.join(PLAN_FILE);
-    if plan_path.exists() {
-        bail!("`{}` already exists", plan_path.display());
+    if !plan_path.exists() {
+        fs::write(&plan_path, EXAMPLE_PLAN)?;
     }
-    fs::write(&plan_path, EXAMPLE_PLAN)?;
     let goal = root.join("goal.md");
     if !goal.exists() {
         fs::write(&goal, "# 实验目标\n")?;
     }
     let config = root.join(CONFIG_FILE);
-    fs::write(&config, toml::to_string(&Config { port })?)?;
-    let script = root.join(".labflow/run");
+    if write_config {
+        fs::write(&config, toml::to_string(&Config { port })?)?;
+    }
+    let script = root.join(".labflow/bin/run");
     fs::write(&script, RUN_SCRIPT)?;
     set_executable(&script)?;
-    println!("initialized {}", root.display());
+    println!("configured {}", root.display());
     Ok(())
 }
 
 const RUN_SCRIPT: &str = r#"#!/usr/bin/env bash
 set -uo pipefail
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ARTIFACTS="$ROOT/.labflow/artifacts"
 CONFIG="$ROOT/.labflow/config"
 POLL_INTERVAL="${LABFLOW_POLL_INTERVAL:-0.1}"

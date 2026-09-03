@@ -17,13 +17,13 @@ fn labflow() -> Command {
 }
 
 #[test]
-fn host_can_initialize_publish_and_unpublish() {
+fn host_can_configure_publish_and_unpublish() {
     let directory = tempfile::tempdir().unwrap();
     labflow()
         .args([
             "--root",
             directory.path().to_str().unwrap(),
-            "init",
+            "config",
             "--port",
             "4096",
         ])
@@ -34,7 +34,7 @@ fn host_can_initialize_publish_and_unpublish() {
         .unwrap();
     assert!(directory.path().join("lab-plan.toml").is_file());
     assert_eq!(Config::load(directory.path()).unwrap().port, 4096);
-    let run = directory.path().join(".labflow/run");
+    let run = directory.path().join(".labflow/bin/run");
     assert!(run.is_file());
     assert!(
         Command::new("bash")
@@ -109,6 +109,71 @@ fn host_can_initialize_publish_and_unpublish() {
             .path()
             .join(".labflow/artifacts/answer.researcher")
             .exists()
+    );
+}
+
+#[test]
+fn config_is_repeatable_without_destroying_lab_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_str().unwrap();
+    assert!(
+        labflow()
+            .args(["--root", root, "config"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(Config::load(directory.path()).unwrap().port, 4096);
+
+    fs::write(directory.path().join(".labflow/config"), "port=4321\n").unwrap();
+    fs::write(directory.path().join("lab-plan.toml"), "custom plan\n").unwrap();
+    fs::write(directory.path().join("goal.md"), "custom goal\n").unwrap();
+    fs::write(directory.path().join(".labflow/states.sqlite"), b"state").unwrap();
+    fs::write(directory.path().join(".labflow/bin/run"), "broken\n").unwrap();
+
+    assert!(
+        labflow()
+            .args(["--root", root, "config"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join(".labflow/config")).unwrap(),
+        "port=4321\n"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("lab-plan.toml")).unwrap(),
+        "custom plan\n"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("goal.md")).unwrap(),
+        "custom goal\n"
+    );
+    assert_eq!(
+        fs::read(directory.path().join(".labflow/states.sqlite")).unwrap(),
+        b"state"
+    );
+    assert!(
+        fs::read_to_string(directory.path().join(".labflow/bin/run"))
+            .unwrap()
+            .starts_with("#!/usr/bin/env bash\n")
+    );
+
+    assert!(
+        labflow()
+            .args(["--root", root, "config", "--port", "5432"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(Config::load(directory.path()).unwrap().port, 5432);
+    assert!(
+        !labflow()
+            .args(["--root", root, "init", "--port", "1234"])
+            .status()
+            .unwrap()
+            .success()
     );
 }
 
@@ -701,7 +766,7 @@ fn run_script_tracks_backend_restart_and_shutdown() {
         .args([
             "--root",
             directory.path().to_str().unwrap(),
-            "init",
+            "config",
             "--port",
             &port.to_string(),
         ])
@@ -734,7 +799,7 @@ fn run_script_tracks_backend_restart_and_shutdown() {
         permissions.set_mode(0o755);
         fs::set_permissions(&opencode, permissions).unwrap();
     }
-    let mut runner = Command::new(directory.path().join(".labflow/run"))
+    let mut runner = Command::new(directory.path().join(".labflow/bin/run"))
         .env("LABFLOW", cargo_bin("labflow"))
         .env("OPENCODE", &opencode)
         .env("LABFLOW_POLL_INTERVAL", "0.02")
@@ -799,7 +864,7 @@ fn run_script_disables_crashing_supervisor_generation() {
         .args([
             "--root",
             directory.path().to_str().unwrap(),
-            "init",
+            "config",
             "--port",
             "4096",
         ])
@@ -814,7 +879,7 @@ fn run_script_disables_crashing_supervisor_generation() {
         ])
         .status()
         .unwrap();
-    let mut runner = Command::new(directory.path().join(".labflow/run"))
+    let mut runner = Command::new(directory.path().join(".labflow/bin/run"))
         .env("LABFLOW", "/bin/false")
         .env("LABFLOW_POLL_INTERVAL", "0.01")
         .stdout(Stdio::null())
