@@ -22,7 +22,7 @@ pub fn build_task_prompt(
         .with_context(|| format!("unknown artifact `{name}`"))?;
     if artifact.kind == ArtifactKind::Bench {
         return Ok(format!(
-            "任务: {name}\n\n要求:\n- 执行 `.labflow/bin/labflow bench start {name}` 开始本轮评测\n- 反复执行 `.labflow/bin/labflow challenge next {name}`，根据返回的 Q、K 和 reply 决定是否使用 `.labflow/bin/labflow challenge clarify {name} '<澄清文本>'`\n- 每道题完成后执行 `.labflow/bin/labflow challenge archive {name}`\n- next 返回 null 后执行 `.labflow/bin/labflow bench finish {name}`\n- 完成后必须先严格回答“完成任务。”，然后再做其他解释\n- 确实无法完成，则必须先严格回答“无法完成任务。”，然后再做其他解释\n"
+            "任务: {name}\n\n要求:\n- 执行 `.labflow/bin/labflow bench start {name}` 开始本轮评测\n- 反复执行 `.labflow/bin/labflow challenge next {name}`，根据返回的 Q、K 和 reply 决定是否使用 `.labflow/bin/labflow challenge clarify {name} '<澄清文本>'`\n- `challenge next` 和 `challenge clarify` 会同步等待被测 Agent；调用 bash 工具时必须把 timeout 设置为 1800000 毫秒\n- 如果 `challenge next` 或 `challenge clarify` 超时或失败，不得执行 archive；必须使用同一条命令重试并取得结果\n- 每道题取得结果后执行 `.labflow/bin/labflow challenge archive {name}`\n- next 返回 null 后执行 `.labflow/bin/labflow bench finish {name}`\n- 完成后必须先严格回答“完成任务。”，然后再做其他解释\n- 确实无法完成，则必须先严格回答“无法完成任务。”，然后再做其他解释\n"
         ));
     }
     let inputs = effective_inputs(root, plan, artifact)?;
@@ -224,5 +224,35 @@ goal = "goal.md"
         .unwrap();
         assert!(prompt.contains("- materials/nested/data.txt: 刚更新"));
         assert!(!prompt.contains("optional.txt"));
+    }
+
+    #[test]
+    fn bench_prompt_accounts_for_synchronous_challenges() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = Plan::parse(
+            r#"
+version = 1
+[roles.evaluator]
+[artifacts."score.evaluator"]
+kind = "bench"
+requires = ["system-active"]
+inputs = ["questions.jsonl"]
+[artifacts."score.evaluator".bench]
+name = "score"
+source = "questions.jsonl"
+"#,
+        )
+        .unwrap();
+        let prompt = build_task_prompt(
+            directory.path(),
+            &plan,
+            &ArtifactName::parse("score.evaluator").unwrap(),
+            &[],
+        )
+        .unwrap();
+
+        assert!(prompt.contains("timeout 设置为 1800000 毫秒"));
+        assert!(prompt.contains("超时或失败，不得执行 archive"));
+        assert!(prompt.contains("必须使用同一条命令重试并取得结果"));
     }
 }
