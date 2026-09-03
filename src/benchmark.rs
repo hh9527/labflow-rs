@@ -190,47 +190,6 @@ struct TextPart<'a> {
     text: &'a str,
 }
 
-#[derive(Deserialize)]
-struct MessageResponse {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    data: Value,
-    #[serde(default)]
-    parts: Vec<MessagePart>,
-}
-
-#[derive(Deserialize)]
-struct MessagePart {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    tool: Option<String>,
-    #[serde(default)]
-    state: Option<PartState>,
-    #[serde(default)]
-    time: Option<PartTime>,
-}
-
-#[derive(Deserialize)]
-struct PartState {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    input: Value,
-    #[serde(default)]
-    time: Option<PartTime>,
-}
-
-#[derive(Clone, Deserialize)]
-struct PartTime {
-    start: i64,
-    #[serde(default)]
-    end: Option<i64>,
-}
-
 #[derive(Serialize)]
 struct PermissionRule {
     permission: String,
@@ -618,10 +577,19 @@ impl Effect {
                     .send()
                     .await?
                     .error_for_status()?;
-                let response: MessageResponse = response.json().await?;
+                let response: Value = response.json().await?;
                 let finished_at = now()?;
-                let actions = response_actions(&response, started_at, finished_at);
-                let reply = response_text(response);
+                let parts = crate::opencode::turn_parts(
+                    &context.client,
+                    &context.backend_url,
+                    &context.root,
+                    &session_id,
+                    &response,
+                    Some(256),
+                )
+                .await;
+                let actions = response_actions(&parts, started_at, finished_at);
+                let reply = response_text(&response);
                 let mut question = question;
                 if !clarification {
                     question.clarifications = 0;
@@ -910,16 +878,19 @@ fn path_patterns(path: &AssetPath) -> Vec<String> {
     }
 }
 
-fn response_text(response: MessageResponse) -> String {
-    if let Some(name) = response.name {
-        let message = response.data["message"].as_str().unwrap_or("unknown error");
+fn response_text(response: &Value) -> String {
+    if let Some(name) = response["name"].as_str() {
+        let message = response["data"]["message"]
+            .as_str()
+            .unwrap_or("unknown error");
         return format!("[OpenCode {name}: {message}]");
     }
-    let text = response
-        .parts
+    let text = response["parts"]
+        .as_array()
         .into_iter()
-        .filter(|part| part.kind == "text")
-        .filter_map(|part| part.text)
+        .flatten()
+        .filter(|part| part["type"] == "text")
+        .filter_map(|part| part["text"].as_str())
         .collect::<Vec<_>>()
         .join("\n");
     if text.trim().is_empty() {
@@ -930,15 +901,14 @@ fn response_text(response: MessageResponse) -> String {
 }
 
 fn response_actions(
-    response: &MessageResponse,
+    parts: &[Value],
     turn_started_at: i64,
     turn_finished_at: i64,
 ) -> Vec<BenchAction> {
-    response
-        .parts
+    parts
         .iter()
         .filter_map(|part| {
-            let raw_kind = part.tool.as_deref().unwrap_or(&part.kind);
+            let raw_kind = part["tool"].as_str().or_else(|| part["type"].as_str())?;
             let kind = match raw_kind.to_ascii_lowercase().as_str() {
                 "reasoning" => "reasoning",
                 "text" => "text",
@@ -947,29 +917,29 @@ fn response_actions(
                 "write" => "write",
                 "glob" => "glob",
                 "bash" => "bash",
-                _ if part.tool.is_some() || part.kind == "tool" => "other-tool",
+                _ if part["tool"].is_string() || part["type"] == "tool" => "other-tool",
                 _ => return None,
             }
             .to_owned();
-            let state = part.state.as_ref();
-            let time = state
-                .and_then(|state| state.time.as_ref())
-                .or(part.time.as_ref());
-            let subject = state.and_then(|state| action_subject(&kind, &state.input));
-            let result = state
-                .and_then(|state| state.status.as_deref())
-                .and_then(action_result);
-            let completed = state.is_none() || result.is_some();
+            let state = &part["state"];
+            let time = if state["time"].is_object() {
+                &state["time"]
+            } else {
+                &part["time"]
+            };
+            let subject = action_subject(&kind, &state["input"]);
+            let result = state["status"].as_str().and_then(action_result);
+            let completed = !state.is_object() || result.is_some();
             Some(BenchAction {
                 kind,
                 subject,
-                started_at: time.map_or(turn_started_at, |time| time.start),
-                finished_at: time
-                    .and_then(|time| time.end)
+                started_at: time["start"].as_i64().unwrap_or(turn_started_at),
+                finished_at: time["end"]
+                    .as_i64()
                     .or(completed.then_some(turn_finished_at)),
                 result: result
                     .map(str::to_owned)
-                    .or_else(|| state.is_none().then(|| "succeeded".into())),
+                    .or_else(|| (!state.is_object()).then(|| "succeeded".into())),
             })
         })
         .collect()
@@ -1050,7 +1020,7 @@ impl Drop for Lock {
 mod tests {
     use serde_json::json;
 
-    use super::{MessageResponse, SourceQuestion, response_text};
+    use super::{SourceQuestion, response_text};
 
     #[test]
     fn hidden_knowledge_may_be_missing_or_null() {
@@ -1065,15 +1035,12 @@ mod tests {
 
     #[test]
     fn respondent_errors_and_empty_replies_are_recorded() {
-        let error: MessageResponse = serde_json::from_value(
-            json!({"name": "UnknownError", "data": {"message": "Agent not found"}}),
-        )
-        .unwrap();
+        let error = json!({"name": "UnknownError", "data": {"message": "Agent not found"}});
         assert_eq!(
-            response_text(error),
+            response_text(&error),
             "[OpenCode UnknownError: Agent not found]"
         );
-        let empty: MessageResponse = serde_json::from_value(json!({"parts": []})).unwrap();
-        assert_eq!(response_text(empty), "[OpenCode returned no text]");
+        let empty = json!({"parts": []});
+        assert_eq!(response_text(&empty), "[OpenCode returned no text]");
     }
 }

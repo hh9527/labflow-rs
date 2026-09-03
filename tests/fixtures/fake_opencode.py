@@ -23,6 +23,32 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/global/health"):
             self.send_json({"healthy": True, "version": "fake"})
+        elif self.path.startswith("/session/ses_respondent/message?"):
+            self.send_json([
+                {"info": {"id": "msg_respondent_step", "role": "assistant", "parentID": "msg_respondent_user", "time": {"created": 20}}, "parts": [
+                    {"type": "reasoning", "time": {"start": 20, "end": 21}},
+                    {"type": "tool", "tool": "bash", "state": {
+                        "status": "completed", "input": {"command": "just verify"},
+                        "time": {"start": 22, "end": 23},
+                    }},
+                ]},
+                {"info": {"id": "msg_respondent", "role": "assistant", "parentID": "msg_respondent_user", "time": {"created": 24}}, "parts": [
+                    {"type": "text", "text": "respondent reply"},
+                ]},
+            ])
+        elif self.path.startswith("/session/ses_worker/message?"):
+            self.send_json([
+                {"info": {"id": "msg_worker_step", "role": "assistant", "parentID": "msg_worker_user", "time": {"created": 10}}, "parts": [
+                    {"type": "reasoning", "time": {"start": 10, "end": 11}},
+                    {"type": "tool", "tool": "read", "state": {
+                        "status": "completed", "input": {"filePath": "goal.md"},
+                        "time": {"start": 12, "end": 13},
+                    }},
+                ]},
+                {"info": {"id": "msg_fake", "role": "assistant", "parentID": "msg_worker_user", "time": {"created": 14}}, "parts": [
+                    {"type": "text", "text": "完成任务。"},
+                ]},
+            ])
         elif self.path.startswith("/event"):
             body = b'data: {"type":"server.connected","properties":{}}\n\n'
             self.send_response(200)
@@ -62,14 +88,8 @@ class Handler(BaseHTTPRequestHandler):
             with open(os.path.join(os.getcwd(), "benchmark-messages.jsonl"), "a", encoding="utf-8") as output:
                 output.write(json.dumps(body) + "\n")
             self.send_json({
-                "info": {"id": "msg_respondent"},
+                "info": {"id": "msg_respondent", "parentID": "msg_respondent_user"},
                 "parts": [
-                    {"type": "reasoning", "time": {"start": 20, "end": 21}},
-                    {"type": "tool", "tool": "bash", "state": {
-                        "status": "completed",
-                        "input": {"command": "just verify"},
-                        "time": {"start": 22, "end": 23},
-                    }},
                     {"type": "text", "text": "respondent reply"},
                 ],
             })
@@ -80,14 +100,8 @@ class Handler(BaseHTTPRequestHandler):
             with open(os.path.join(os.getcwd(), "answer.md"), "w", encoding="utf-8") as output:
                 output.write("fake answer\n")
             self.send_json({
-                "info": {"id": "msg_fake"},
+                "info": {"id": "msg_fake", "parentID": "msg_worker_user"},
                 "parts": [
-                    {"type": "reasoning", "time": {"start": 10, "end": 11}},
-                    {"type": "tool", "tool": "read", "state": {
-                        "status": "completed",
-                        "input": {"filePath": "goal.md"},
-                        "time": {"start": 12, "end": 13},
-                    }},
                     {"type": "text", "text": "完成任务。"},
                 ],
             })

@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod db;
 pub mod domain;
+pub mod opencode;
 pub mod plan;
 pub mod prompt;
 pub mod query;

@@ -652,7 +652,16 @@ impl Effect {
                 let value: Value = response.json().await?;
                 let content = response_text(&value);
                 let finished_at = system_time_micros(SystemTime::now());
-                let actions = response_actions(&value, started_at, finished_at);
+                let parts = crate::opencode::turn_parts(
+                    &context.client,
+                    &context.backend_url,
+                    &context.root,
+                    &session_id,
+                    &value,
+                    None,
+                )
+                .await;
+                let actions = response_actions(&parts, started_at, finished_at);
                 let longest_reasoning_ms = actions
                     .iter()
                     .filter(|action| action.kind == "reasoning")
@@ -884,14 +893,12 @@ fn response_text(value: &Value) -> String {
 }
 
 fn response_actions(
-    value: &Value,
+    parts: &[Value],
     started_at: Timestamp,
     finished_at: Timestamp,
 ) -> Vec<TimelineAction> {
-    value["parts"]
-        .as_array()
-        .into_iter()
-        .flatten()
+    parts
+        .iter()
         .filter_map(|part| {
             let source_kind = part["tool"].as_str().or_else(|| part["type"].as_str())?;
             let kind = match source_kind.to_ascii_lowercase().as_str() {
