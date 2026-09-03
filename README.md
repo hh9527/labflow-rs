@@ -21,6 +21,8 @@ labflow plan check
 labflow publish system-supervisor system-backend system-active query-request
 labflow publish '!query-request'
 labflow host-tasks --poll 60
+labflow query-bench solver -e 'SELECT * FROM bench_round'
+labflow query-bench solver -f analysis.sql
 labflow status
 ```
 
@@ -84,6 +86,11 @@ commands = ["just verify"]
 `source` 是本轮完整、有序的 JSONL 题集，每行格式为
 `{"id":"q1","Q":"...","K":"...","R":"...","tags":["..."]}`；
 `K`、参考答案 `R` 和 `tags` 均可选。
+
+`query-bench` 使用 `bench.name` 定位内部数据库。`-e/--execute` 接受内联 SQL，
+`-f/--file` 从实验室根目录读取 SQL 文件，两者必须且只能指定一个。数据库以
+只读模式打开，结果输出为 `{"columns":[...],"rows":[...]}` JSON；BLOB 表示为
+`{"base64":"..."}`。
 
 artifact 的角色始终是后缀，例如 `answer.researcher`。Host 可以通过 publish
 普通名称或 `!名称` 操作非 `_` 的实体 artifact；Learn artifact 和 `_blocked`

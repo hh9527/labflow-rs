@@ -72,6 +72,11 @@ pub struct Bench {
 pub struct BenchName(String);
 
 impl BenchName {
+    pub fn parse(value: &str) -> Result<Self> {
+        validate_part(value)?;
+        Ok(Self(value.to_owned()))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -82,9 +87,15 @@ impl<'de> Deserialize<'de> for BenchName {
     where
         D: serde::Deserializer<'de>,
     {
-        let value = String::deserialize(deserializer)?;
-        validate_part(&value).map_err(serde::de::Error::custom)?;
-        Ok(Self(value))
+        Self::parse(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+impl std::str::FromStr for BenchName {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Self::parse(value)
     }
 }
 

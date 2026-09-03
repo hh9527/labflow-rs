@@ -133,6 +133,18 @@ labflow challenge archive bench-solver.a2
 labflow bench finish bench-solver.a2
 ```
 
+Host 可以按稳定的 `bench.name` 对 records 执行只读分析查询：
+
+```text
+labflow query-bench solver -e 'SELECT * FROM bench_round'
+labflow query-bench solver -f analysis.sql
+```
+
+`-e/--execute` 与 `-f/--file` 必须且只能指定一个；相对 SQL 文件名以实验室根
+目录解析。命令使用 SQLite read-only connection，数据库不存在或 SQL 尝试写入
+时返回非零。成功结果为 `{"columns":[...],"rows":[...]}` JSON，SQL NULL、整数、
+浮点数和文本映射为对应 JSON 类型，BLOB 映射为 `{"base64":"..."}`。
+
 `.labflow/artifacts/bench-solver.a2` 仍是表示该次构建完成的名义制品文件，
 与追加保存所有历史轮次的 `.labflow/benchmarks/solver.sqlite` 相互独立。
 

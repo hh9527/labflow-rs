@@ -552,6 +552,47 @@ commands = ["just verify"]
         )
         .unwrap();
     assert_eq!(command, "just verify");
+
+    let output = invoke(&[
+        "query-bench",
+        "solver",
+        "-e",
+        "SELECT question_id, reference_answer FROM question",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "columns": ["question_id", "reference_answer"],
+            "rows": [["q1", "reference"]]
+        })
+    );
+
+    fs::write(
+        directory.path().join("tag-count.sql"),
+        "SELECT tag, count(*) FROM question_tag GROUP BY tag ORDER BY tag",
+    )
+    .unwrap();
+    let output = invoke(&["query-bench", "solver", "-f", "tag-count.sql"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "columns": ["tag", "count(*)"],
+            "rows": [["hard", 1], ["logic", 1]]
+        })
+    );
+
+    let output = invoke(&["query-bench", "solver", "-e", "DELETE FROM question_tag"]);
+    assert!(!output.status.success());
     backend.kill().unwrap();
     backend.wait().unwrap();
 }

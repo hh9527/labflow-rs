@@ -3,13 +3,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use crate::artifact::{ARTIFACTS_DIR, ArtifactName, publish, unpublish};
 use crate::benchmark;
 use crate::config::{CONFIG_FILE, Config};
 use crate::db::{read_host_tasks, read_virtual_timestamp};
-use crate::plan::{ArtifactKind, EXAMPLE_PLAN, PLAN_FILE, Plan};
+use crate::plan::{ArtifactKind, BenchName, EXAMPLE_PLAN, PLAN_FILE, Plan};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Artifact-driven laboratory supervisor")]
@@ -46,6 +46,7 @@ enum Command {
         #[arg(long, value_name = "SECONDS")]
         poll: Option<u64>,
     },
+    QueryBench(QueryBenchArgs),
     Bench {
         #[command(subcommand)]
         command: BenchCommand,
@@ -54,6 +55,20 @@ enum Command {
         #[command(subcommand)]
         command: ChallengeCommand,
     },
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("source")
+        .required(true)
+        .args(["execute", "file"])
+))]
+struct QueryBenchArgs {
+    name: BenchName,
+    #[arg(short = 'e', long = "execute")]
+    execute: Option<String>,
+    #[arg(short = 'f', long = "file", value_name = "SQL_FILE")]
+    file: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -103,6 +118,24 @@ pub async fn run() -> Result<()> {
         }
         Command::Run => crate::runner::run(root).await,
         Command::HostTasks { poll } => host_tasks(&root, poll).await,
+        Command::QueryBench(arguments) => {
+            let sql = match (arguments.execute, arguments.file) {
+                (Some(sql), None) => sql,
+                (None, Some(path)) => {
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        root.join(path)
+                    };
+                    fs::read_to_string(&path)
+                        .with_context(|| format!("failed to read `{}`", path.display()))?
+                }
+                _ => unreachable!("clap requires exactly one query source"),
+            };
+            let output = benchmark::query(&root, &arguments.name, &sql)?;
+            println!("{}", serde_json::to_string(&output)?);
+            Ok(())
+        }
         Command::Bench { command } => match command {
             BenchCommand::Start { name } => {
                 benchmark::run(root, name, benchmark::Command::Start).await
