@@ -18,10 +18,7 @@ pub struct State {
     pub observer_request: Option<u64>,
     pub sessions: BTreeMap<String, Session>,
     pub tasks: BTreeMap<ArtifactName, Task>,
-    pub backend_generation: Option<Option<Timestamp>>,
     pub backend_ready: bool,
-    pub backend_process: ProcessStatus,
-    pub backend_process_generation: Option<Timestamp>,
     pub supervisor_generation: Option<Option<Timestamp>>,
     pub plan_generation: Option<Option<Timestamp>>,
     pub next_request_id: u64,
@@ -44,10 +41,7 @@ impl State {
             observer_request: None,
             sessions: BTreeMap::new(),
             tasks: BTreeMap::new(),
-            backend_generation: None,
             backend_ready: false,
-            backend_process: ProcessStatus::Stopped,
-            backend_process_generation: None,
             supervisor_generation: None,
             plan_generation: None,
             next_request_id: 1,
@@ -103,14 +97,6 @@ pub struct Session {
     pub busy: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProcessStatus {
-    Stopped,
-    Starting,
-    Running,
-    Stopping,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Task {
     pub status: TaskStatus,
@@ -159,22 +145,8 @@ pub enum Event {
         name: ArtifactName,
         modified: Option<Timestamp>,
     },
-    BackendReady {
-        generation: Timestamp,
-    },
-    BackendStarted {
-        generation: Timestamp,
-    },
-    BackendStartFailed {
-        generation: Timestamp,
-        reason: String,
-    },
-    BackendExited {
-        generation: Timestamp,
-        status: String,
-    },
-    BackendRetry {
-        generation: Timestamp,
+    BackendAvailabilityChanged {
+        ready: bool,
     },
     ObserverSessionCreated {
         request_id: u64,
@@ -300,13 +272,6 @@ pub enum Effect {
         artifact: ArtifactName,
         request_id: u64,
     },
-    StartBackend {
-        generation: Timestamp,
-    },
-    StopBackend,
-    DelayBackendRetry {
-        generation: Timestamp,
-    },
     Log {
         message: String,
     },
@@ -322,61 +287,9 @@ impl Event {
             Event::ArtifactObserved { name, modified } => {
                 reduce_artifact_observed(state, name, modified)
             }
-            Event::BackendReady { generation } => {
-                if state.backend_generation == Some(Some(generation))
-                    && state.backend_process == ProcessStatus::Running
-                {
-                    state.backend_ready = true;
-                }
+            Event::BackendAvailabilityChanged { ready } => {
+                state.backend_ready = ready;
                 Vec::new()
-            }
-            Event::BackendStarted { generation } => {
-                if state.backend_generation == Some(Some(generation))
-                    && state.backend_process == ProcessStatus::Starting
-                    && state.backend_process_generation == Some(generation)
-                {
-                    state.backend_process = ProcessStatus::Running;
-                }
-                Vec::new()
-            }
-            Event::BackendStartFailed { generation, reason } => {
-                if state.backend_process_generation != Some(generation) {
-                    Vec::new()
-                } else {
-                    state.backend_process = ProcessStatus::Stopped;
-                    state.backend_process_generation = None;
-                    let desired = state.backend_generation.flatten();
-                    if desired == Some(generation) {
-                        vec![
-                            Effect::Log {
-                                message: format!("backend start failed: {reason}"),
-                            },
-                            Effect::DelayBackendRetry { generation },
-                        ]
-                    } else if let Some(desired) = desired {
-                        state.backend_process = ProcessStatus::Starting;
-                        state.backend_process_generation = Some(desired);
-                        vec![Effect::StartBackend {
-                            generation: desired,
-                        }]
-                    } else {
-                        Vec::new()
-                    }
-                }
-            }
-            Event::BackendExited { generation, status } => {
-                reduce_backend_exited(state, generation, status)
-            }
-            Event::BackendRetry { generation } => {
-                if state.backend_generation == Some(Some(generation))
-                    && state.backend_process == ProcessStatus::Stopped
-                {
-                    state.backend_process = ProcessStatus::Starting;
-                    state.backend_process_generation = Some(generation);
-                    vec![Effect::StartBackend { generation }]
-                } else {
-                    Vec::new()
-                }
             }
             Event::ObserverSessionCreated {
                 request_id,
@@ -667,26 +580,6 @@ fn reduce_artifact_observed(
     }];
 
     match name.as_str() {
-        "system-backend" => {
-            if state.backend_generation != Some(modified) {
-                state.backend_ready = false;
-                match state.backend_process {
-                    ProcessStatus::Stopped => {
-                        if let Some(generation) = modified {
-                            state.backend_process = ProcessStatus::Starting;
-                            state.backend_process_generation = Some(generation);
-                            effects.push(Effect::StartBackend { generation });
-                        }
-                    }
-                    ProcessStatus::Starting | ProcessStatus::Running => {
-                        state.backend_process = ProcessStatus::Stopping;
-                        effects.push(Effect::StopBackend);
-                    }
-                    ProcessStatus::Stopping => {}
-                }
-            }
-            state.backend_generation = Some(modified);
-        }
         "system-supervisor" => {
             if state.supervisor_generation.is_some()
                 && state.supervisor_generation != Some(modified)
@@ -732,41 +625,6 @@ fn reduce_artifact_observed(
         }
     }
     effects
-}
-
-fn reduce_backend_exited(state: &mut State, generation: Timestamp, status: String) -> Vec<Effect> {
-    if state.backend_process_generation != Some(generation) {
-        return Vec::new();
-    }
-    if !matches!(
-        state.backend_process,
-        ProcessStatus::Running | ProcessStatus::Stopping
-    ) {
-        return Vec::new();
-    }
-    state.backend_ready = false;
-    let was_stopping = state.backend_process == ProcessStatus::Stopping;
-    state.backend_process = ProcessStatus::Stopped;
-    state.backend_process_generation = None;
-    let Some(desired) = state.backend_generation.flatten() else {
-        return Vec::new();
-    };
-    if was_stopping || desired != generation {
-        state.backend_process = ProcessStatus::Starting;
-        state.backend_process_generation = Some(desired);
-        vec![Effect::StartBackend {
-            generation: desired,
-        }]
-    } else {
-        vec![
-            Effect::Log {
-                message: format!("backend exited with {status}"),
-            },
-            Effect::DelayBackendRetry {
-                generation: desired,
-            },
-        ]
-    }
 }
 
 fn reduce_session_created(
@@ -1227,7 +1085,6 @@ mod tests {
 
     fn state() -> State {
         let mut state = State::new(Arc::new(Plan::parse(EXAMPLE_PLAN).unwrap()));
-        state.backend_generation = Some(Some(1));
         state.backend_ready = true;
         state
             .artifacts
@@ -1453,52 +1310,21 @@ requires = ["system-active"]
     }
 
     #[test]
-    fn backend_process_transitions_are_reducer_owned() {
-        let mut state = State::new(Arc::new(Plan::parse(EXAMPLE_PLAN).unwrap()));
-        let effects = observed("system-backend", 10).reduce(&mut state);
-        assert_eq!(state.backend_process, ProcessStatus::Starting);
-        assert!(effects.contains(&Effect::StartBackend { generation: 10 }));
-
-        Event::BackendStarted { generation: 10 }.reduce(&mut state);
-        Event::BackendReady { generation: 10 }.reduce(&mut state);
-        assert_eq!(state.backend_process, ProcessStatus::Running);
+    fn backend_availability_controls_scheduling() {
+        let mut state = state();
+        state.backend_ready = false;
+        observed("query-request", 1).reduce(&mut state);
+        observed("system-active", 2).reduce(&mut state);
+        assert!(state.tasks.is_empty());
+        let effects = Event::BackendAvailabilityChanged { ready: true }.reduce(&mut state);
         assert!(state.backend_ready);
-
-        let effects = observed("system-backend", 11).reduce(&mut state);
-        assert_eq!(state.backend_process, ProcessStatus::Stopping);
-        assert!(effects.contains(&Effect::StopBackend));
-        let stale = Event::BackendStartFailed {
-            generation: 99,
-            reason: "stale".into(),
-        }
-        .reduce(&mut state);
         assert!(
-            stale
+            effects
                 .iter()
-                .all(|effect| !matches!(effect, Effect::StartBackend { .. }))
+                .any(|effect| matches!(effect, Effect::CreateObserverSession { .. }))
         );
-        assert_eq!(state.backend_process, ProcessStatus::Stopping);
-        let effects = Event::BackendExited {
-            generation: 10,
-            status: "stopped".into(),
-        }
-        .reduce(&mut state);
-        assert_eq!(state.backend_process, ProcessStatus::Starting);
-        assert!(effects.contains(&Effect::StartBackend { generation: 11 }));
-
-        Event::BackendStarted { generation: 11 }.reduce(&mut state);
-        let effects = Event::ArtifactObserved {
-            name: ArtifactName::parse("system-backend").unwrap(),
-            modified: None,
-        }
-        .reduce(&mut state);
-        assert!(effects.contains(&Effect::StopBackend));
-        Event::BackendExited {
-            generation: 11,
-            status: "stopped".into(),
-        }
-        .reduce(&mut state);
-        assert_eq!(state.backend_process, ProcessStatus::Stopped);
+        Event::BackendAvailabilityChanged { ready: false }.reduce(&mut state);
+        assert!(!state.backend_ready);
     }
 
     #[test]

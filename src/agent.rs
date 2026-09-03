@@ -130,7 +130,7 @@ fn path_rules(patterns: BTreeSet<String>) -> Value {
 }
 
 pub fn materialize(root: &Path, profiles: &BTreeMap<ArtifactName, AgentProfile>) -> Result<()> {
-    let directory = root.join(".opencode/agents");
+    let directory = root.join(".labflow/opencode/agents");
     fs::create_dir_all(&directory)?;
     for profile in profiles.values() {
         materialize_one(&directory, profile)?;
@@ -163,7 +163,7 @@ fn materialize_one(directory: &Path, profile: &AgentProfile) -> Result<()> {
 }
 
 pub fn materialize_profile(root: &Path, profile: &AgentProfile) -> Result<()> {
-    let directory = root.join(".opencode/agents");
+    let directory = root.join(".labflow/opencode/agents");
     fs::create_dir_all(&directory)?;
     materialize_one(&directory, profile)
 }
@@ -222,7 +222,7 @@ permissions = ["bash"]
         materialize(root.path(), &generated).unwrap();
         let path = root
             .path()
-            .join(".opencode/agents")
+            .join(".labflow/opencode/agents")
             .join(format!("{}.md", first.id));
         fs::write(&path, "corrupt").unwrap();
         assert!(materialize(root.path(), &generated).is_err());

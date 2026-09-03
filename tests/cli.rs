@@ -36,6 +36,14 @@ fn host_can_initialize_publish_and_unpublish() {
     assert_eq!(Config::load(directory.path()).unwrap().port, 4096);
     let run = directory.path().join(".labflow/run");
     assert!(run.is_file());
+    assert!(
+        Command::new("bash")
+            .arg("-n")
+            .arg(&run)
+            .status()
+            .unwrap()
+            .success()
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -130,6 +138,16 @@ assets = ["answer.md"]
 check = ["answer.md"]
 "#;
     fs::write(directory.path().join("lab-plan.toml"), plan).unwrap();
+    let mut backend = Command::new("python3")
+        .args([fake.to_str().unwrap(), "--port", &port.to_string()])
+        .current_dir(directory.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    wait_until(Duration::from_secs(5), || {
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+    });
     labflow()
         .args([
             "--root",
@@ -143,10 +161,6 @@ check = ["answer.md"]
     let supervisor_output = directory.path().join("supervisor-output.log");
     let mut supervisor = labflow()
         .args(["--root", directory.path().to_str().unwrap(), "supervisor"])
-        .env(
-            "LABFLOW_BACKEND_COMMAND",
-            serde_json::to_string(&vec!["python3", fake.to_str().unwrap()]).unwrap(),
-        )
         .stdout(fs::File::create(&supervisor_output).unwrap())
         .stderr(Stdio::inherit())
         .spawn()
@@ -166,27 +180,6 @@ check = ["answer.md"]
                 )
             })
             .is_ok_and(|count| count == 1)
-    });
-    wait_until(Duration::from_secs(10), || {
-        fs::read_to_string(directory.path().join("backend-starts"))
-            .is_ok_and(|content| !content.is_empty())
-    });
-    let backend_starts = fs::read_to_string(directory.path().join("backend-starts"))
-        .unwrap()
-        .lines()
-        .count();
-    labflow()
-        .args([
-            "--root",
-            directory.path().to_str().unwrap(),
-            "publish",
-            "system-backend",
-        ])
-        .status()
-        .unwrap();
-    wait_until(Duration::from_secs(10), || {
-        fs::read_to_string(directory.path().join("backend-starts"))
-            .is_ok_and(|content| content.lines().count() > backend_starts)
     });
     labflow()
         .args([
@@ -213,11 +206,12 @@ check = ["answer.md"]
                 .join(".labflow/artifacts/answer.researcher")
                 .is_file()
     });
-    let agents = fs::read_dir(directory.path().join(".opencode/agents"))
+    let agents = fs::read_dir(directory.path().join(".labflow/opencode/agents"))
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(agents.len(), 1);
+    assert!(!directory.path().join(".opencode").exists());
     let agent_name = agents[0].file_name().into_string().unwrap();
     assert!(agent_name.starts_with("researcher."));
     assert!(agent_name.ends_with(".md"));
@@ -235,19 +229,6 @@ check = ["answer.md"]
             })
             .is_ok_and(|records| records > 0)
     });
-    labflow()
-        .args([
-            "--root",
-            directory.path().to_str().unwrap(),
-            "publish",
-            "!system-backend",
-        ])
-        .status()
-        .unwrap();
-    wait_until(Duration::from_secs(10), || {
-        child_pids(supervisor.id()).is_empty()
-    });
-
     labflow()
         .args([
             "--root",
@@ -335,6 +316,8 @@ check = ["answer.md"]
     assert!(output.contains("answer.researcher 已经启动刷新"));
     assert!(output.contains("answer.researcher 完成刷新（耗时 "));
     assert!(output.contains("，最长思考 "));
+    backend.kill().unwrap();
+    backend.wait().unwrap();
 }
 
 #[test]
@@ -711,7 +694,106 @@ fn invalid_plan_requests_system_plan_and_recovers() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn run_tracks_supervisor_artifact_lifecycle() {
+fn run_script_tracks_backend_restart_and_shutdown() {
+    let directory = tempfile::tempdir().unwrap();
+    let port = available_port();
+    labflow()
+        .args([
+            "--root",
+            directory.path().to_str().unwrap(),
+            "init",
+            "--port",
+            &port.to_string(),
+        ])
+        .status()
+        .unwrap();
+    labflow()
+        .args([
+            "--root",
+            directory.path().to_str().unwrap(),
+            "publish",
+            "system-supervisor",
+            "system-backend",
+        ])
+        .status()
+        .unwrap();
+    let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_opencode.py");
+    let opencode = directory.path().join("fake-opencode");
+    fs::write(
+        &opencode,
+        format!(
+            "#!/usr/bin/env bash\nprintf '%s\n%s\n%s\n' \"$PWD\" \"${{OPENCODE_CONFIG_DIR:-}}\" \"${{OPENCODE_DISABLE_PROJECT_CONFIG:-}}\" > launcher-env\n[[ \"${{1:-}}\" != serve ]] || shift\nexec python3 '{}' \"$@\"\n",
+            fake.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&opencode).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&opencode, permissions).unwrap();
+    }
+    let mut runner = Command::new(directory.path().join(".labflow/run"))
+        .env("LABFLOW", cargo_bin("labflow"))
+        .env("OPENCODE", &opencode)
+        .env("LABFLOW_POLL_INTERVAL", "0.02")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let runner_pid = runner.id();
+    wait_until(Duration::from_secs(10), || {
+        fs::read_to_string(directory.path().join("backend-starts"))
+            .is_ok_and(|content| content.lines().count() == 1)
+    });
+    assert_eq!(
+        fs::read_to_string(directory.path().join("launcher-env")).unwrap(),
+        format!(
+            "{}\n{}\n1\n",
+            directory.path().display(),
+            directory.path().join(".labflow/opencode").display()
+        )
+    );
+    let first = fs::read_to_string(directory.path().join("backend-starts"))
+        .unwrap()
+        .lines()
+        .count();
+    labflow()
+        .args([
+            "--root",
+            directory.path().to_str().unwrap(),
+            "publish",
+            "system-backend",
+        ])
+        .status()
+        .unwrap();
+    wait_until(Duration::from_secs(10), || {
+        fs::read_to_string(directory.path().join("backend-starts"))
+            .is_ok_and(|content| content.lines().count() > first)
+    });
+    Command::new("kill")
+        .args(["-TERM", &runner_pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(runner.wait().unwrap().success());
+    assert!(
+        !directory
+            .path()
+            .join(".labflow/artifacts/system-supervisor")
+            .exists()
+    );
+    assert!(
+        !directory
+            .path()
+            .join(".labflow/artifacts/system-backend")
+            .exists()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn run_script_disables_crashing_supervisor_generation() {
     let directory = tempfile::tempdir().unwrap();
     labflow()
         .args([
@@ -732,90 +814,9 @@ fn run_tracks_supervisor_artifact_lifecycle() {
         ])
         .status()
         .unwrap();
-    let mut runner = labflow()
-        .args(["--root", directory.path().to_str().unwrap(), "run"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let runner_pid = runner.id();
-    let mut first = String::new();
-    wait_until(Duration::from_secs(10), || {
-        first = child_pids(runner_pid);
-        !first.is_empty()
-    });
-    labflow()
-        .args([
-            "--root",
-            directory.path().to_str().unwrap(),
-            "publish",
-            "system-supervisor",
-        ])
-        .status()
-        .unwrap();
-    wait_until(Duration::from_secs(10), || {
-        let current = child_pids(runner_pid);
-        !current.is_empty() && current != first
-    });
-    labflow()
-        .args([
-            "--root",
-            directory.path().to_str().unwrap(),
-            "publish",
-            "!system-supervisor",
-        ])
-        .status()
-        .unwrap();
-    wait_until(Duration::from_secs(10), || {
-        child_pids(runner_pid).is_empty()
-    });
-    labflow()
-        .args([
-            "--root",
-            directory.path().to_str().unwrap(),
-            "publish",
-            "system-supervisor",
-        ])
-        .status()
-        .unwrap();
-    wait_until(Duration::from_secs(10), || {
-        !child_pids(runner_pid).is_empty()
-    });
-    Command::new("kill")
-        .args(["-TERM", &runner_pid.to_string()])
-        .status()
-        .unwrap();
-    assert!(runner.wait().unwrap().success());
-    assert!(
-        !directory
-            .path()
-            .join(".labflow/artifacts/system-supervisor")
-            .exists()
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn run_unpublishes_crashing_supervisor_generation() {
-    let directory = tempfile::tempdir().unwrap();
-    fs::create_dir_all(directory.path().join(".labflow/artifacts")).unwrap();
-    fs::write(directory.path().join(".labflow/config"), "invalid").unwrap();
-    fs::write(
-        directory.path().join("lab-plan.toml"),
-        labflow::plan::EXAMPLE_PLAN,
-    )
-    .unwrap();
-    labflow()
-        .args([
-            "--root",
-            directory.path().to_str().unwrap(),
-            "publish",
-            "system-supervisor",
-        ])
-        .status()
-        .unwrap();
-    let mut runner = labflow()
-        .args(["--root", directory.path().to_str().unwrap(), "run"])
+    let mut runner = Command::new(directory.path().join(".labflow/run"))
+        .env("LABFLOW", "/bin/false")
+        .env("LABFLOW_POLL_INTERVAL", "0.01")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -831,14 +832,6 @@ fn run_unpublishes_crashing_supervisor_generation() {
         .status()
         .unwrap();
     assert!(runner.wait().unwrap().success());
-}
-
-#[cfg(target_os = "linux")]
-fn child_pids(pid: u32) -> String {
-    fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
-        .unwrap_or_default()
-        .trim()
-        .to_owned()
 }
 
 fn available_port() -> u16 {

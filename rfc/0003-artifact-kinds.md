@@ -62,9 +62,15 @@ commands = ["just verify"]
 
 ## 计划简化
 
-计划删除 `[backend]`。supervisor 固定在 `.labflow/config` 所指定的端口和
-`127.0.0.1` 上运行 `opencode serve`。该进程仍由 supervisor 的 reducer/effect
-状态机管理。
+计划删除 `[backend]`。生成的 Bash `.labflow/run` 从 `.labflow/config` 读取端口，
+并在 `127.0.0.1` 上运行 `opencode serve`；supervisor 只连接该服务并根据健康状态
+暂停或恢复调度，不拥有 OpenCode 进程。
+
+实验室 OpenCode 以仓库根为工作目录，但 Bash launcher 设置
+`OPENCODE_CONFIG_DIR=<root>/.labflow/opencode` 和
+`OPENCODE_DISABLE_PROJECT_CONFIG=1`。生成的 agent profile 位于
+`.labflow/opencode/agents/`，与同一仓库中 Host OpenCode 使用的 `.opencode/`
+完全隔离。
 
 `roles.<role>.kind` 被删除。所有显式 role 都是 DAG worker，固定基础提示词为：
 
@@ -169,7 +175,7 @@ content-addressed OpenCode agent profile：
 - `bench.permissions`。
 
 ID 形如 `bench-solver-a2.<sha256>`，对应
-`.opencode/agents/<id>.md`。profile 只创建、不修改；相同内容复用同一身份，配置
+`.labflow/opencode/agents/<id>.md`。profile 只创建、不修改；相同内容复用同一身份，配置
 变化产生新身份。每次 `bench start` 创建全新的顶层 R session，每次消息显式
 指定该 profile，`bench finish` 必须删除 session 后才能转正轮次。
 

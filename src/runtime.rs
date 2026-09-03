@@ -4,12 +4,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use inotify::{Inotify, WatchMask};
 use reqwest::Client;
 use serde_json::{Value, json};
-use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
@@ -20,19 +19,6 @@ use crate::db::{Databases, TimelineAction};
 use crate::domain::{Effect, Event, TaskAnswer, Timestamp};
 use crate::plan::Plan;
 use crate::prompt::{build_task_prompt, check_task};
-
-enum BackendCommand {
-    Start(Timestamp),
-    Stop,
-}
-
-struct BackendManagerContext {
-    root: PathBuf,
-    port: u16,
-    client: Client,
-    url: Arc<String>,
-    event_tx: mpsc::Sender<Event>,
-}
 
 enum SupervisorControlEvent {
     Started,
@@ -155,7 +141,6 @@ struct EffectContext {
     client: Client,
     backend_url: Arc<String>,
     event_tx: mpsc::Sender<Event>,
-    backend_tx: mpsc::Sender<BackendCommand>,
     shutdown_tx: watch::Sender<bool>,
     reload_tx: watch::Sender<bool>,
 }
@@ -247,7 +232,6 @@ async fn run_generation(
     let mut state = databases.restore(plan.clone())?;
     state.supervisor_generation = Some(expected_supervisor_generation);
     let (event_tx, mut event_rx) = mpsc::channel::<Event>(256);
-    let (backend_tx, backend_rx) = mpsc::channel(8);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (reload_tx, mut reload_rx) = watch::channel(false);
     let config = Config::load(&root)?;
@@ -262,20 +246,14 @@ async fn run_generation(
         client: client.clone(),
         backend_url: backend_url.clone(),
         event_tx: event_tx.clone(),
-        backend_tx: backend_tx.clone(),
         shutdown_tx: shutdown_tx.clone(),
         reload_tx,
     });
 
-    let backend_handle = spawn_backend_manager(
-        BackendManagerContext {
-            root: root.clone(),
-            port: config.port,
-            client: client.clone(),
-            url: backend_url.clone(),
-            event_tx: event_tx.clone(),
-        },
-        backend_rx,
+    let backend_health_handle = spawn_backend_health_monitor(
+        client.clone(),
+        backend_url.clone(),
+        event_tx.clone(),
         shutdown_rx.clone(),
     );
     let watcher_handle =
@@ -338,10 +316,9 @@ async fn run_generation(
     let _ = shutdown_tx.send(true);
     effect_tasks.abort_all();
     while effect_tasks.join_next().await.is_some() {}
-    let _ = backend_tx.send(BackendCommand::Stop).await;
     watcher_handle.abort();
     event_stream_handle.abort();
-    let _ = backend_handle.await;
+    backend_health_handle.abort();
     Ok(reload)
 }
 
@@ -723,24 +700,6 @@ impl Effect {
                 artifact,
                 request_id: _,
             } => publish(&context.root, &artifact),
-            Effect::StartBackend { generation } => context
-                .backend_tx
-                .send(BackendCommand::Start(generation))
-                .await
-                .map_err(|_| anyhow!("backend manager stopped")),
-            Effect::StopBackend => context
-                .backend_tx
-                .send(BackendCommand::Stop)
-                .await
-                .map_err(|_| anyhow!("backend manager stopped")),
-            Effect::DelayBackendRetry { generation } => {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                context
-                    .event_tx
-                    .send(Event::BackendRetry { generation })
-                    .await
-                    .map_err(|_| anyhow!("event loop stopped"))
-            }
             Effect::Log { message } => {
                 eprintln!("{message}");
                 Ok(())
@@ -763,67 +722,29 @@ impl Effect {
     }
 }
 
-fn spawn_backend_manager(
-    context: BackendManagerContext,
-    mut commands: mpsc::Receiver<BackendCommand>,
+fn spawn_backend_health_monitor(
+    client: Client,
+    url: Arc<String>,
+    event_tx: mpsc::Sender<Event>,
     mut shutdown: watch::Receiver<bool>,
-) -> JoinHandle<Result<()>> {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut child: Option<Child> = None;
-        let mut generation = None;
-        let mut poll = tokio::time::interval(Duration::from_millis(100));
+        let mut previous = None;
+        let mut poll = tokio::time::interval(Duration::from_millis(250));
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                command = commands.recv() => match command {
-                    Some(BackendCommand::Start(requested)) => {
-                        match start_backend(&context.root, context.port) {
-                            Ok(process) => {
-                                child = Some(process);
-                                generation = Some(requested);
-                                let _ = context.event_tx.send(Event::BackendStarted {
-                                    generation: requested,
-                                }).await;
-                                spawn_backend_health_check(&context, requested);
-                            }
-                            Err(error) => {
-                                let _ = context.event_tx.send(Event::BackendStartFailed {
-                                    generation: requested,
-                                    reason: error.to_string(),
-                                }).await;
-                            }
-                        }
-                    }
-                    Some(BackendCommand::Stop) => {
-                        if let (Some(process), Some(active)) = (&mut child, generation) {
-                            stop_child(process).await;
-                            let status = process.try_wait()?.map_or_else(
-                                || "stopped".to_owned(),
-                                |status| status.to_string(),
-                            );
-                            child = None;
-                            generation = None;
-                            let _ = context.event_tx.send(Event::BackendExited {
-                                generation: active,
-                                status,
-                            }).await;
-                        }
-                    }
-                    None => break,
-                },
                 _ = poll.tick() => {
-                    let exited = child
-                        .as_mut()
-                        .map(|process| process.try_wait())
-                        .transpose()?
-                        .flatten();
-                    if let Some(status) = exited {
-                        child = None;
-                        if let Some(active) = generation.take() {
-                            let _ = context.event_tx.send(Event::BackendExited {
-                                generation: active,
-                                status: status.to_string(),
-                            }).await;
+                    let ready = client
+                        .get(format!("{url}/global/health"))
+                        .timeout(Duration::from_millis(200))
+                        .send()
+                        .await
+                        .is_ok_and(|response| response.status().is_success());
+                    if previous != Some(ready) {
+                        previous = Some(ready);
+                        if event_tx.send(Event::BackendAvailabilityChanged { ready }).await.is_err() {
+                            break;
                         }
                     }
                 }
@@ -832,74 +753,7 @@ fn spawn_backend_manager(
                 }
             }
         }
-        if let Some(process) = &mut child {
-            stop_child(process).await;
-        }
-        Ok(())
     })
-}
-
-fn spawn_backend_health_check(context: &BackendManagerContext, generation: Timestamp) {
-    let client = context.client.clone();
-    let url = context.url.clone();
-    let event_tx = context.event_tx.clone();
-    tokio::spawn(async move {
-        if wait_for_backend(&client, &url).await.is_ok() {
-            let _ = event_tx.send(Event::BackendReady { generation }).await;
-        } else {
-            eprintln!("OpenCode backend did not become healthy");
-        }
-    });
-}
-
-fn start_backend(root: &Path, port: u16) -> Result<Child> {
-    let configured = std::env::var("LABFLOW_BACKEND_COMMAND").ok();
-    let command_parts: Vec<String> = configured
-        .as_deref()
-        .map(serde_json::from_str)
-        .transpose()
-        .context("LABFLOW_BACKEND_COMMAND must be a JSON string array")?
-        .unwrap_or_else(|| vec!["opencode".into(), "serve".into()]);
-    let (program, arguments) = command_parts
-        .split_first()
-        .context("backend command cannot be empty")?;
-    let mut command = Command::new(program);
-    command
-        .args(arguments)
-        .arg("--hostname")
-        .arg("127.0.0.1")
-        .arg("--port")
-        .arg(port.to_string())
-        .current_dir(root)
-        .kill_on_drop(true);
-    command.spawn().with_context(|| {
-        format!(
-            "failed to start backend command `{}`",
-            command_parts.join(" ")
-        )
-    })
-}
-
-async fn stop_child(child: &mut Child) {
-    if child.try_wait().ok().flatten().is_none() {
-        let _ = child.kill().await;
-    }
-}
-
-async fn wait_for_backend(client: &Client, url: &str) -> Result<()> {
-    for _ in 0..100 {
-        if client
-            .get(format!("{url}/global/health"))
-            .timeout(Duration::from_millis(300))
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
-        {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    bail!("OpenCode backend did not become healthy at {url}")
 }
 
 fn spawn_artifact_watcher(

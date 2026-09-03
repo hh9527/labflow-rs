@@ -42,7 +42,6 @@ enum Command {
         #[arg(long, hide = true)]
         generation: Option<i64>,
     },
-    Run,
     HostTasks {
         #[arg(long, value_name = "SECONDS")]
         poll: Option<u64>,
@@ -117,7 +116,6 @@ pub async fn run() -> Result<()> {
             };
             crate::runtime::run(root, generation).await
         }
-        Command::Run => crate::runner::run(root).await,
         Command::HostTasks { poll } => host_tasks(&root, poll).await,
         Command::QueryBench(arguments) => {
             let sql = match (arguments.execute, arguments.file) {
@@ -191,14 +189,142 @@ fn init(root: &Path, port: u16) -> Result<()> {
     let config = root.join(CONFIG_FILE);
     fs::write(&config, toml::to_string(&Config { port })?)?;
     let script = root.join(".labflow/run");
-    fs::write(
-        &script,
-        "#!/bin/sh\nset -eu\nROOT=$(CDPATH= cd -- \"$(dirname -- \"$0\")/..\" && pwd)\nexec labflow --root \"$ROOT\" run\n",
-    )?;
+    fs::write(&script, RUN_SCRIPT)?;
     set_executable(&script)?;
     println!("initialized {}", root.display());
     Ok(())
 }
+
+const RUN_SCRIPT: &str = r#"#!/usr/bin/env bash
+set -uo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+ARTIFACTS="$ROOT/.labflow/artifacts"
+CONFIG="$ROOT/.labflow/config"
+POLL_INTERVAL="${LABFLOW_POLL_INTERVAL:-0.1}"
+LABFLOW="${LABFLOW:-labflow}"
+OPENCODE="${OPENCODE:-opencode}"
+
+mkdir -p -- "$ARTIFACTS"
+cd -- "$ROOT"
+
+read_port() {
+    local line=""
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*port[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    done < "$CONFIG"
+    return 1
+}
+
+PORT="$(read_port)" || {
+    echo "cannot read port from $CONFIG" >&2
+    exit 1
+}
+
+mtime() {
+    stat -Lc '%y' -- "$1" 2>/dev/null
+}
+
+supervisor_loop() {
+    local control="$ARTIFACTS/system-supervisor"
+    local generation="" previous="" pid="" failures=0 status=0
+    trap '[[ -z "$pid" ]] || kill -TERM "$pid" 2>/dev/null || true; exit 0' TERM
+    while :; do
+        if [[ ! -e "$control" ]]; then
+            previous=""
+            failures=0
+            sleep "$POLL_INTERVAL"
+            continue
+        fi
+        generation="$(mtime "$control")" || continue
+        if [[ "$generation" != "$previous" ]]; then
+            previous="$generation"
+            failures=0
+        fi
+        "$LABFLOW" --root "$ROOT" supervisor &
+        pid=$!
+        wait "$pid"
+        status=$?
+        pid=""
+        if [[ -e "$control" ]] && [[ "$(mtime "$control")" == "$generation" ]]; then
+            failures=$((failures + 1))
+            if (( failures >= 3 )); then
+                echo "supervisor exited three times for one generation; disabling system-supervisor" >&2
+                rm -f -- "$control"
+            else
+                echo "supervisor exited with $status; restarting" >&2
+            fi
+        fi
+    done
+}
+
+backend_loop() {
+    local control="$ARTIFACTS/system-backend"
+    local generation="" previous="" current="" pid="" failures=0 status=0
+    trap '[[ -z "$pid" ]] || kill -TERM "$pid" 2>/dev/null || true; exit 0' TERM
+    while :; do
+        if [[ ! -e "$control" ]]; then
+            previous=""
+            failures=0
+            sleep "$POLL_INTERVAL"
+            continue
+        fi
+        generation="$(mtime "$control")" || continue
+        if [[ "$generation" != "$previous" ]]; then
+            previous="$generation"
+            failures=0
+        fi
+        OPENCODE_CONFIG_DIR="$ROOT/.labflow/opencode" \
+        OPENCODE_DISABLE_PROJECT_CONFIG=1 \
+        "$OPENCODE" serve --hostname 127.0.0.1 --port "$PORT" &
+        pid=$!
+        while kill -0 "$pid" 2>/dev/null; do
+            if [[ ! -e "$control" ]]; then
+                kill -TERM "$pid" 2>/dev/null || true
+                break
+            fi
+            current="$(mtime "$control")" || current=""
+            if [[ "$current" != "$generation" ]]; then
+                kill -TERM "$pid" 2>/dev/null || true
+                break
+            fi
+            sleep "$POLL_INTERVAL"
+        done
+        wait "$pid"
+        status=$?
+        pid=""
+        if [[ -e "$control" ]] && [[ "$(mtime "$control")" == "$generation" ]]; then
+            failures=$((failures + 1))
+            if (( failures >= 3 )); then
+                echo "backend exited three times for one generation; disabling system-backend" >&2
+                rm -f -- "$control"
+            else
+                echo "backend exited with $status; restarting" >&2
+            fi
+        fi
+    done
+}
+
+supervisor_loop_pid=""
+backend_loop_pid=""
+shutdown() {
+    trap - TERM
+    rm -f -- "$ARTIFACTS/system-supervisor" "$ARTIFACTS/system-backend"
+    [[ -z "$supervisor_loop_pid" ]] || kill -TERM "$supervisor_loop_pid" 2>/dev/null || true
+    [[ -z "$backend_loop_pid" ]] || kill -TERM "$backend_loop_pid" 2>/dev/null || true
+}
+trap shutdown TERM
+
+supervisor_loop &
+supervisor_loop_pid=$!
+backend_loop &
+backend_loop_pid=$!
+wait "$supervisor_loop_pid" "$backend_loop_pid"
+exit 0
+"#;
 
 fn publish_many(root: &Path, operations: &[String]) -> Result<()> {
     let plan = Plan::load(root).ok();

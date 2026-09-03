@@ -33,8 +33,8 @@ labflow status
 .labflow/run
 ```
 
-`.labflow/run` 持有 supervisor，supervisor 持有 OpenCode backend。也可以直接
-运行一次 supervisor：
+`.labflow/run` 是不依赖 Labflow 常驻进程的 Bash launcher，直接持有 supervisor
+和 OpenCode 两个子进程。也可以在已经运行 OpenCode 时直接运行一次 supervisor：
 
 ```sh
 labflow supervisor
@@ -43,6 +43,11 @@ labflow supervisor
 `system-supervisor` 和 `system-backend` 的创建、touch、删除分别控制对应进程
 的启动、重启和停止。修改计划后 publish `system-plan` 才会使新计划生效；
 加载失败时 `host-tasks` 会请求 Host 再次 publish `system-plan`。
+
+实验室 OpenCode 仍以仓库根目录为工作目录，但使用
+`OPENCODE_CONFIG_DIR=.labflow/opencode` 并禁用 project config。Labflow 生成的
+agent profile 位于 `.labflow/opencode/agents/`，不会写入或读取 Host 使用的
+仓库根 `.opencode/`。
 
 ## 计划示例
 
