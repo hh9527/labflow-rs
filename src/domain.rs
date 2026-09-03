@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifact::ArtifactName;
 use crate::db::HostTasks;
-use crate::plan::Plan;
+use crate::plan::{ArtifactKind, Plan};
 
 pub type Timestamp = i64;
 
@@ -56,10 +56,19 @@ impl State {
     }
 
     pub fn timestamp(&self, name: &ArtifactName) -> Option<Timestamp> {
-        self.virtual_artifacts
+        if self
+            .plan
+            .artifacts
             .get(name)
-            .copied()
-            .or_else(|| self.artifacts.get(name).copied().flatten())
+            .is_some_and(|artifact| artifact.kind == ArtifactKind::Learn)
+        {
+            self.virtual_artifacts.get(name).copied()
+        } else {
+            self.virtual_artifacts
+                .get(name)
+                .copied()
+                .or_else(|| self.artifacts.get(name).copied().flatten())
+        }
     }
 
     pub fn is_active(&self) -> bool {
@@ -226,7 +235,7 @@ pub enum Effect {
     },
     PersistVirtualArtifact {
         name: ArtifactName,
-        modified: Timestamp,
+        modified: Option<Timestamp>,
     },
     PersistObserverSession {
         session_id: String,
@@ -778,19 +787,26 @@ fn reduce_session_created(
         busy: false,
     };
     state.sessions.insert(role.clone(), session.clone());
-    let ready = ArtifactName::parse(&format!("_ready.{role}")).expect("validated role");
-    let ready_at = state.next_timestamp();
-    state.virtual_artifacts.insert(ready.clone(), ready_at);
-    let mut effects = vec![
-        Effect::PersistSession {
-            role: role.clone(),
-            session,
-        },
-        Effect::PersistVirtualArtifact {
-            name: ready,
-            modified: ready_at,
-        },
-    ];
+    let mut effects = vec![Effect::PersistSession {
+        role: role.clone(),
+        session,
+    }];
+    let learned: Vec<_> = state
+        .plan
+        .artifacts
+        .iter()
+        .filter(|(name, artifact)| {
+            name.role() == Some(role.as_str()) && artifact.kind == ArtifactKind::Learn
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in learned {
+        state.virtual_artifacts.remove(&name);
+        effects.push(Effect::PersistVirtualArtifact {
+            name,
+            modified: None,
+        });
+    }
     for (artifact, task) in &mut state.tasks {
         if artifact.role() == Some(role.as_str()) && task.status == TaskStatus::WaitingSession {
             task.status = TaskStatus::Preparing;
@@ -916,6 +932,7 @@ fn reduce_task_checked(
     request_id: u64,
     missing: Vec<String>,
 ) -> Vec<Effect> {
+    let is_learn = state.plan.artifacts[&artifact].kind == ArtifactKind::Learn;
     let Some(task) = current_task_mut(state, &artifact, request_id) else {
         return Vec::new();
     };
@@ -923,6 +940,35 @@ fn reduce_task_checked(
         return Vec::new();
     }
     if missing.is_empty() {
+        if is_learn {
+            let task = state.tasks.remove(&artifact).expect("task exists");
+            let modified = state.next_timestamp();
+            state.virtual_artifacts.insert(artifact.clone(), modified);
+            let role = artifact.role().expect("learn artifact has role").to_owned();
+            let session_id = state.sessions.get(&role).map(|session| session.id.clone());
+            let mut effects = vec![
+                Effect::PersistTask {
+                    artifact: artifact.clone(),
+                    task: None,
+                },
+                Effect::PersistVirtualArtifact {
+                    name: artifact.clone(),
+                    modified: Some(modified),
+                },
+                Effect::ReportRefreshCompleted {
+                    artifact,
+                    request_id,
+                    longest_reasoning_ms: task.longest_reasoning_ms.unwrap_or_default(),
+                },
+            ];
+            if let Some(session_id) = session_id {
+                effects.push(Effect::RenameSession {
+                    session_id,
+                    title: format!("[{role}] 等待任务"),
+                });
+            }
+            return effects;
+        }
         task.status = TaskStatus::Publishing;
         vec![
             Effect::PersistTask {
@@ -990,7 +1036,10 @@ fn block(state: &mut State) -> Vec<Effect> {
     let name = ArtifactName::parse("_blocked").expect("built-in name");
     let modified = state.next_timestamp();
     state.virtual_artifacts.insert(name.clone(), modified);
-    vec![Effect::PersistVirtualArtifact { name, modified }]
+    vec![Effect::PersistVirtualArtifact {
+        name,
+        modified: Some(modified),
+    }]
 }
 
 fn block_task(
@@ -1034,9 +1083,7 @@ fn schedule(state: &mut State) -> Vec<Effect> {
         .filter(|(name, artifact)| {
             let output = state.timestamp(name);
             let required_exist = artifact.requires.iter().all(|dependency| {
-                dependency.optional
-                    || dependency.name.as_str().starts_with("_ready.")
-                    || state.timestamp(&dependency.name).is_some()
+                dependency.optional || state.timestamp(&dependency.name).is_some()
             });
             let stale = output.is_none()
                 || artifact.requires.iter().any(|dependency| {
@@ -1288,7 +1335,6 @@ mod tests {
             r#"
 version = 1
 [roles.r]
-kind = "lab-worker"
 [artifacts.request]
 [artifacts.feedback]
 [artifacts."answer.r"]
@@ -1314,6 +1360,73 @@ requires = ["request", "feedback?"]
         assert_eq!(
             state.host_tasks.opt,
             vec![ArtifactName::parse("feedback").unwrap()]
+        );
+    }
+
+    #[test]
+    fn new_session_invalidates_and_success_republishes_learn_artifact() {
+        let plan = Plan::parse(
+            r#"version = 1
+[roles.r]
+[artifacts."learn-domain.r"]
+kind = "learn"
+goal = "learn.md"
+requires = ["system-active"]
+"#,
+        )
+        .unwrap();
+        let name = ArtifactName::parse("learn-domain.r").unwrap();
+        let mut state = State::new(Arc::new(plan));
+        state.backend_ready = true;
+        state.virtual_artifacts.insert(name.clone(), 1);
+        observed("system-active", 2).reduce(&mut state);
+        let request_id = state.tasks[&name].request_id;
+        let effects = Event::SessionCreated {
+            role: "r".into(),
+            request_id,
+            session_id: "ses_new".into(),
+        }
+        .reduce(&mut state);
+        assert_eq!(state.timestamp(&name), None);
+        assert!(effects.contains(&Effect::PersistVirtualArtifact {
+            name: name.clone(),
+            modified: None,
+        }));
+
+        Event::TaskPrepared {
+            artifact: name.clone(),
+            request_id,
+            prompt: "learn".into(),
+        }
+        .reduce(&mut state);
+        let agent_id = state.tasks[&name].agent_id.clone();
+        Event::TaskAnswered {
+            artifact: name.clone(),
+            request_id,
+            agent_id,
+            content: "完成任务。".into(),
+            longest_reasoning_ms: 7,
+        }
+        .reduce(&mut state);
+        let effects = Event::TaskChecked {
+            artifact: name.clone(),
+            request_id,
+            missing: Vec::new(),
+        }
+        .reduce(&mut state);
+        assert!(state.timestamp(&name).is_some());
+        assert!(!state.tasks.contains_key(&name));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PersistVirtualArtifact {
+                name: persisted,
+                modified: Some(_)
+            } if persisted == &name
+        )));
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::PublishArtifact { .. }))
         );
     }
 

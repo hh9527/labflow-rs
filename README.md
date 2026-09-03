@@ -1,7 +1,9 @@
 # Labflow
 
 Labflow 是由 artifact DAG 驱动的持续实验室 supervisor。设计规范见
-[`rfc/0001-mvp.md`](rfc/0001-mvp.md)。
+[`rfc/0001-mvp.md`](rfc/0001-mvp.md)、
+[`rfc/0002-benchmark.md`](rfc/0002-benchmark.md) 和
+[`rfc/0003-artifact-kinds.md`](rfc/0003-artifact-kinds.md)。后者定义当前计划表面。
 
 ## 构建
 
@@ -44,28 +46,46 @@ labflow supervisor
 ```toml
 version = 1
 
-[backend]
-command = ["opencode", "serve"]
-hostname = "127.0.0.1"
-
 [roles.researcher]
-kind = "lab-worker"
 permissions = ["webfetch"]
+
+[roles.evaluator]
+permissions = []
 
 [artifacts.query-request]
 assets = ["goal.md"]
 
 [artifacts."answer.researcher"]
-requires = ["system-active", "_ready.researcher", "query-request"]
+requires = ["system-active", "learn-domain.researcher", "query-request"]
 goal = "goal.md"
 assets = ["answer.md"]
 check = ["answer.md"]
 permissions = ["webfetch"]
+
+[artifacts."learn-domain.researcher"]
+kind = "learn"
+goal = "goals/learn-domain.md"
+inputs = ["knowledge/domain/"]
+
+[artifacts."bench-answer.evaluator"]
+kind = "bench"
+requires = ["answer.researcher"]
+assets = ["benchmarks/answer.sqlite"]
+
+[artifacts."bench-answer.evaluator".bench]
+source = "benchmark/questions.jsonl"
+qlist = "benchmark/current.ids"
+public-knowledge = ["benchmark/public/"]
+
+[artifacts."bench-answer.evaluator".bench.permissions]
+write = ["benchmark/workspace/"]
+commands = ["just verify"]
 ```
 
 artifact 的角色始终是后缀，例如 `answer.researcher`。Host 可以通过 publish
-普通名称或 `!名称` 操作任意非 `_` artifact；`_ready.researcher`、`_blocked`
-等名称仅由 supervisor 控制。
+普通名称或 `!名称` 操作非 `_` 的实体 artifact；Learn artifact 和 `_blocked`
+等虚拟名称仅由 supervisor 控制。角色每次建立新 session 时，其 Learn artifact
+自动失效并重新学习。Bench 的被测 Agent profile 由配置自动生成。
 
 文件访问由 artifact 自动确定：`assets` 可读写和删除，`inputs` 只读，`goal`
 只读；Glob 允许发现路径，Grep 禁用。手写 `permissions` 只声明其他 OpenCode

@@ -202,12 +202,20 @@ impl Databases {
         Ok(())
     }
 
-    pub fn persist_virtual(&self, name: &ArtifactName, modified: Timestamp) -> Result<()> {
-        Connection::open(&self.states)?.execute(
-            "INSERT INTO virtual_artifacts(name, modified) VALUES (?1, ?2)
-             ON CONFLICT(name) DO UPDATE SET modified = excluded.modified",
-            params![name.as_str(), modified],
-        )?;
+    pub fn persist_virtual(&self, name: &ArtifactName, modified: Option<Timestamp>) -> Result<()> {
+        let connection = Connection::open(&self.states)?;
+        if let Some(modified) = modified {
+            connection.execute(
+                "INSERT INTO virtual_artifacts(name, modified) VALUES (?1, ?2)
+                 ON CONFLICT(name) DO UPDATE SET modified = excluded.modified",
+                params![name.as_str(), modified],
+            )?;
+        } else {
+            connection.execute(
+                "DELETE FROM virtual_artifacts WHERE name = ?1",
+                params![name.as_str()],
+            )?;
+        }
         Ok(())
     }
 
@@ -381,7 +389,7 @@ mod tests {
         let artifact = ArtifactName::parse("query-request").unwrap();
         databases.persist_artifact(&artifact, Some(42)).unwrap();
         let blocked = ArtifactName::parse("_blocked").unwrap();
-        databases.persist_virtual(&blocked, 43).unwrap();
+        databases.persist_virtual(&blocked, Some(43)).unwrap();
         let state = databases
             .restore(Arc::new(Plan::parse(EXAMPLE_PLAN).unwrap()))
             .unwrap();

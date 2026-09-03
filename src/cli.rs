@@ -9,7 +9,7 @@ use crate::artifact::{ARTIFACTS_DIR, ArtifactName, publish, unpublish};
 use crate::benchmark;
 use crate::config::{CONFIG_FILE, Config};
 use crate::db::{read_host_tasks, read_virtual_timestamp};
-use crate::plan::{EXAMPLE_PLAN, PLAN_FILE, Plan};
+use crate::plan::{ArtifactKind, EXAMPLE_PLAN, PLAN_FILE, Plan};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Artifact-driven laboratory supervisor")]
@@ -160,12 +160,14 @@ fn init(root: &Path, port: u16) -> Result<()> {
 }
 
 fn publish_many(root: &Path, operations: &[String]) -> Result<()> {
+    let plan = Plan::load(root).ok();
     for operation in operations {
         if let Some(raw_name) = operation.strip_prefix('!') {
             if raw_name.is_empty() {
                 bail!("missing artifact name after `!`");
             }
             let artifact = ArtifactName::parse(raw_name)?;
+            reject_learn_publish(plan.as_ref(), &artifact)?;
             let removed = unpublish(root, &artifact)?;
             println!(
                 "{} {artifact}",
@@ -177,9 +179,20 @@ fn publish_many(root: &Path, operations: &[String]) -> Result<()> {
             );
         } else {
             let artifact = ArtifactName::parse(operation)?;
+            reject_learn_publish(plan.as_ref(), &artifact)?;
             publish(root, &artifact)?;
             println!("published {artifact}");
         }
+    }
+    Ok(())
+}
+
+fn reject_learn_publish(plan: Option<&Plan>, artifact: &ArtifactName) -> Result<()> {
+    if plan
+        .and_then(|plan| plan.artifacts.get(artifact))
+        .is_some_and(|definition| definition.kind == ArtifactKind::Learn)
+    {
+        bail!("learn artifact `{artifact}` is controlled by supervisor");
     }
     Ok(())
 }
@@ -232,18 +245,17 @@ fn status(root: &Path, filter: Option<&ArtifactName>) -> Result<()> {
                 .collect::<Result<Vec<_>>>()?,
             )
             .chain(std::iter::once(ArtifactName::parse("_blocked")?))
-            .chain(
-                plan.roles
-                    .keys()
-                    .map(|role| ArtifactName::parse(&format!("_ready.{role}")))
-                    .collect::<Result<Vec<_>>>()?,
-            )
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect(),
     };
     for name in names {
-        if name.is_supervisor() {
+        if name.is_supervisor()
+            || plan
+                .artifacts
+                .get(&name)
+                .is_some_and(|artifact| artifact.kind == ArtifactKind::Learn)
+        {
             match read_virtual_timestamp(root, &name)? {
                 Some(modified) => println!("{name}\tpublished\t{modified}"),
                 None => println!("{name}\tnot-published"),

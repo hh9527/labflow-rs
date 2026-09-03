@@ -18,7 +18,7 @@ use crate::artifact::{ARTIFACTS_DIR, ArtifactName, publish};
 use crate::config::Config;
 use crate::db::{Databases, TimelineAction};
 use crate::domain::{Effect, Event, TaskAnswer, Timestamp};
-use crate::plan::{Backend, Plan};
+use crate::plan::Plan;
 use crate::prompt::{build_task_prompt, check_task};
 
 enum BackendCommand {
@@ -28,7 +28,6 @@ enum BackendCommand {
 
 struct BackendManagerContext {
     root: PathBuf,
-    backend: Backend,
     port: u16,
     client: Client,
     url: Arc<String>,
@@ -252,7 +251,7 @@ async fn run_generation(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (reload_tx, mut reload_rx) = watch::channel(false);
     let config = Config::load(&root)?;
-    let backend_url = Arc::new(format!("http://{}:{}", plan.backend.hostname, config.port));
+    let backend_url = Arc::new(format!("http://127.0.0.1:{}", config.port));
     let client = Client::builder()
         .timeout(Duration::from_secs(30 * 60))
         .build()?;
@@ -271,7 +270,6 @@ async fn run_generation(
     let backend_handle = spawn_backend_manager(
         BackendManagerContext {
             root: root.clone(),
-            backend: plan.backend.clone(),
             port: config.port,
             client: client.clone(),
             url: backend_url.clone(),
@@ -779,7 +777,7 @@ fn spawn_backend_manager(
             tokio::select! {
                 command = commands.recv() => match command {
                     Some(BackendCommand::Start(requested)) => {
-                        match start_backend(&context.root, &context.backend, context.port) {
+                        match start_backend(&context.root, context.port) {
                             Ok(process) => {
                                 child = Some(process);
                                 generation = Some(requested);
@@ -854,16 +852,22 @@ fn spawn_backend_health_check(context: &BackendManagerContext, generation: Times
     });
 }
 
-fn start_backend(root: &Path, backend: &Backend, port: u16) -> Result<Child> {
-    let (program, arguments) = backend
-        .command
+fn start_backend(root: &Path, port: u16) -> Result<Child> {
+    let configured = std::env::var("LABFLOW_BACKEND_COMMAND").ok();
+    let command_parts: Vec<String> = configured
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .context("LABFLOW_BACKEND_COMMAND must be a JSON string array")?
+        .unwrap_or_else(|| vec!["opencode".into(), "serve".into()]);
+    let (program, arguments) = command_parts
         .split_first()
         .context("backend command cannot be empty")?;
     let mut command = Command::new(program);
     command
         .args(arguments)
         .arg("--hostname")
-        .arg(&backend.hostname)
+        .arg("127.0.0.1")
         .arg("--port")
         .arg(port.to_string())
         .current_dir(root)
@@ -871,7 +875,7 @@ fn start_backend(root: &Path, backend: &Backend, port: u16) -> Result<Child> {
     command.spawn().with_context(|| {
         format!(
             "failed to start backend command `{}`",
-            backend.command.join(" ")
+            command_parts.join(" ")
         )
     })
 }

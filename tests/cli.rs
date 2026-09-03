@@ -117,13 +117,8 @@ fn supervisor_runs_task_and_exits_on_control_artifact() {
     fs::write(directory.path().join("goal.md"), "write answer.md").unwrap();
     let fake =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_opencode.py");
-    let plan = format!(
-        r#"version = 1
-[backend]
-command = ["python3", "{}"]
-hostname = "127.0.0.1"
+    let plan = r#"version = 1
 [roles.researcher]
-kind = "lab-worker"
 permissions = []
 [artifacts.query-request]
 assets = ["goal.md"]
@@ -132,9 +127,7 @@ requires = ["query-request"]
 goal = "goal.md"
 assets = ["answer.md"]
 check = ["answer.md"]
-"#,
-        fake.display()
-    );
+"#;
     fs::write(directory.path().join("lab-plan.toml"), plan).unwrap();
     labflow()
         .args([
@@ -149,6 +142,10 @@ check = ["answer.md"]
     let supervisor_output = directory.path().join("supervisor-output.log");
     let mut supervisor = labflow()
         .args(["--root", directory.path().to_str().unwrap(), "supervisor"])
+        .env(
+            "LABFLOW_BACKEND_COMMAND",
+            serde_json::to_string(&vec!["python3", fake.to_str().unwrap()]).unwrap(),
+        )
         .stdout(fs::File::create(&supervisor_output).unwrap())
         .stderr(Stdio::inherit())
         .spawn()
@@ -396,16 +393,15 @@ fn benchmark_cli_runs_isolated_respondent_round() {
     fs::write(
         directory.path().join("lab-plan.toml"),
         r#"version = 1
-[backend]
-hostname = "127.0.0.1"
 [roles.challenger]
-kind = "evaluator"
-[benchmark."solver.challenger"]
-records = "bench/results.sqlite"
+[artifacts."bench-solver.challenger"]
+kind = "bench"
+assets = ["bench/results.sqlite"]
+[artifacts."bench-solver.challenger".bench]
 public-knowledge = ["public/"]
-challenge.source = "questions.jsonl"
-challenge.questions = "questions.ids"
-[benchmark."solver.challenger".respondent]
+source = "questions.jsonl"
+qlist = "questions.ids"
+[artifacts."bench-solver.challenger".bench.permissions]
 write = ["workspace/result.json"]
 commands = ["just verify"]
 "#,
@@ -437,7 +433,7 @@ commands = ["just verify"]
             .output()
             .unwrap()
     };
-    let output = invoke(&["bench", "start", "solver.challenger"]);
+    let output = invoke(&["bench", "start", "bench-solver.challenger"]);
     assert!(
         output.status.success(),
         "{}",
@@ -445,7 +441,7 @@ commands = ["just verify"]
     );
     assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["round"].is_i64());
 
-    let output = invoke(&["challenge", "next", "solver.challenger"]);
+    let output = invoke(&["challenge", "next", "bench-solver.challenger"]);
     assert!(
         output.status.success(),
         "{}",
@@ -459,7 +455,7 @@ commands = ["just verify"]
     let output = invoke(&[
         "challenge",
         "clarify",
-        "solver.challenger",
+        "bench-solver.challenger",
         "use the public rule",
     ]);
     assert!(
@@ -472,17 +468,17 @@ commands = ["just verify"]
         "respondent reply"
     );
     assert!(
-        invoke(&["challenge", "archive", "solver.challenger"])
+        invoke(&["challenge", "archive", "bench-solver.challenger"])
             .status
             .success()
     );
-    let output = invoke(&["challenge", "next", "solver.challenger"]);
+    let output = invoke(&["challenge", "next", "bench-solver.challenger"]);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
         serde_json::Value::Null
     );
     assert!(
-        invoke(&["bench", "finish", "solver.challenger"])
+        invoke(&["bench", "finish", "bench-solver.challenger"])
             .status
             .success()
     );
@@ -491,7 +487,11 @@ commands = ["just verify"]
         serde_json::from_slice(&fs::read(directory.path().join("benchmark-session.json")).unwrap())
             .unwrap();
     assert!(session.get("parentID").is_none());
-    assert_eq!(session["agent"], "solver");
+    assert!(
+        session["agent"]
+            .as_str()
+            .is_some_and(|agent| agent.starts_with("bench-solver-challenger."))
+    );
     assert!(directory.path().join("benchmark-deleted").is_file());
     let records = Connection::open(directory.path().join("bench/results.sqlite")).unwrap();
     assert_eq!(
@@ -541,6 +541,40 @@ commands = ["just verify"]
     assert_eq!(command, "just verify");
     backend.kill().unwrap();
     backend.wait().unwrap();
+}
+
+#[test]
+fn host_cannot_publish_or_unpublish_learn_artifact() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("lab-plan.toml"),
+        r#"version = 1
+[roles.r]
+[artifacts."learn-domain.r"]
+kind = "learn"
+goal = "learn.md"
+"#,
+    )
+    .unwrap();
+    for operation in ["learn-domain.r", "!learn-domain.r"] {
+        let output = labflow()
+            .args([
+                "--root",
+                directory.path().to_str().unwrap(),
+                "publish",
+                operation,
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("controlled by supervisor"));
+    }
+    assert!(
+        !directory
+            .path()
+            .join(".labflow/artifacts/learn-domain.r")
+            .exists()
+    );
 }
 
 #[test]

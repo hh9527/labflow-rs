@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::artifact::ArtifactName;
 use crate::config::Config;
-use crate::plan::{AssetPath, Benchmark, PLAN_FILE, Plan};
+use crate::plan::{ArtifactKind, AssetPath, Bench, PLAN_FILE, Plan};
 
 #[derive(Clone, Debug)]
 pub enum Command {
@@ -405,7 +406,8 @@ impl Event {
 struct ContextData {
     root: PathBuf,
     name: String,
-    benchmark: Benchmark,
+    benchmark: Bench,
+    respondent_id: String,
     records: PathBuf,
     backend_url: String,
     client: Client,
@@ -413,12 +415,18 @@ struct ContextData {
 
 pub async fn run(root: PathBuf, name: String, command: Command) -> Result<()> {
     let plan = Plan::load(&root)?;
-    let benchmark = plan
-        .benchmarks
-        .get(name.as_str())
-        .cloned()
-        .with_context(|| format!("unknown benchmark `{name}`"))?;
-    let records = benchmark.records.resolve(&root);
+    let artifact_name = ArtifactName::parse(&name)?;
+    let artifact = plan
+        .artifacts
+        .get(&artifact_name)
+        .with_context(|| format!("unknown artifact `{name}`"))?;
+    if artifact.kind != ArtifactKind::Bench {
+        bail!("artifact `{name}` is not a bench artifact");
+    }
+    let benchmark = artifact.bench.clone().expect("normalized bench artifact");
+    let records = artifact.assets[0].resolve(&root);
+    let profile = crate::agent::respondent_profile(&artifact_name, &benchmark);
+    crate::agent::materialize_profile(&root, &profile)?;
     if let Some(parent) = records.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -430,8 +438,9 @@ pub async fn run(root: PathBuf, name: String, command: Command) -> Result<()> {
         root,
         name,
         benchmark,
+        respondent_id: profile.id,
         records,
-        backend_url: format!("http://{}:{}", plan.backend.hostname, config.port),
+        backend_url: format!("http://127.0.0.1:{}", config.port),
         client: Client::builder()
             .timeout(Duration::from_secs(30 * 60))
             .build()?,
@@ -466,7 +475,7 @@ impl Effect {
                 let transaction = connection.transaction()?;
                 transaction.execute(
                     "INSERT INTO bench_round(status, respondent, started_at, configuration_revision) VALUES ('current', ?1, ?2, ?3)",
-                    params![context.benchmark.respondent, now, configuration_revision],
+                    params![context.respondent_id, now, configuration_revision],
                 )?;
                 let round_id = transaction.last_insert_rowid();
                 for question in &questions {
@@ -495,7 +504,7 @@ impl Effect {
                         .query(&[("directory", context.root.to_string_lossy().as_ref())])
                         .json(&CreateSessionRequest {
                             title: format!("labflow:bench:{}:{round_id}", context.name),
-                            agent: &context.benchmark.respondent,
+                            agent: &context.respondent_id,
                             permission: respondent_permissions(&context.benchmark),
                         })
                         .send()
@@ -571,7 +580,7 @@ impl Effect {
                     ))
                     .query(&[("directory", context.root.to_string_lossy().as_ref())])
                     .json(&MessageRequest {
-                        agent: &context.benchmark.respondent,
+                        agent: &context.respondent_id,
                         parts: [TextPart {
                             kind: "text",
                             text: &prompt,
@@ -779,7 +788,7 @@ struct SourceQuestion {
 }
 
 fn load_questions(context: &ContextData) -> Result<Vec<Question>> {
-    let source = fs::read_to_string(context.benchmark.challenge.source.resolve(&context.root))?;
+    let source = fs::read_to_string(context.benchmark.source.resolve(&context.root))?;
     let mut catalog = BTreeMap::new();
     for (index, line) in source
         .lines()
@@ -792,7 +801,7 @@ fn load_questions(context: &ContextData) -> Result<Vec<Question>> {
             bail!("duplicate question id in challenge source");
         }
     }
-    let ids = fs::read_to_string(context.benchmark.challenge.questions.resolve(&context.root))?;
+    let ids = fs::read_to_string(context.benchmark.qlist.resolve(&context.root))?;
     let mut seen = BTreeSet::new();
     ids.lines()
         .map(str::trim)
@@ -817,7 +826,7 @@ fn load_questions(context: &ContextData) -> Result<Vec<Question>> {
         .collect()
 }
 
-fn respondent_permissions(benchmark: &Benchmark) -> Vec<PermissionRule> {
+fn respondent_permissions(benchmark: &Bench) -> Vec<PermissionRule> {
     let mut rules = vec![
         rule("*", "*", "deny"),
         rule("glob", "*", "allow"),
@@ -826,19 +835,19 @@ fn respondent_permissions(benchmark: &Benchmark) -> Vec<PermissionRule> {
     for path in benchmark
         .public_knowledge
         .iter()
-        .chain(&benchmark.respondent_access.read)
-        .chain(&benchmark.respondent_access.write)
+        .chain(&benchmark.permissions.read)
+        .chain(&benchmark.permissions.write)
     {
         for pattern in path_patterns(path) {
             rules.push(rule("read", &pattern, "allow"));
         }
     }
-    for path in &benchmark.respondent_access.write {
+    for path in &benchmark.permissions.write {
         for pattern in path_patterns(path) {
             rules.push(rule("edit", &pattern, "allow"));
         }
     }
-    for command in &benchmark.respondent_access.commands {
+    for command in &benchmark.permissions.commands {
         rules.push(rule("bash", command, "allow"));
     }
     rules

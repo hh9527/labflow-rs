@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::artifact::ArtifactName;
-use crate::plan::{AssetPath, Plan, RoleKind};
+use crate::plan::{ArtifactKind, AssetPath, Bench, Plan};
 
 const TEMPLATE_VERSION: u32 = 1;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -25,23 +25,19 @@ pub fn profile(plan: &Plan, artifact: &ArtifactName) -> AgentProfile {
     let role_name = artifact.role().expect("agent profiles belong to roles");
     let role = &plan.roles[role_name];
     let permissions = definition.permissions.as_ref().unwrap_or(&role.permissions);
-    let role_kind = match role.kind {
-        RoleKind::LabWorker => "实验员",
-        RoleKind::Evaluator => "评估员",
-    };
 
     let mut permission = Map::new();
     permission.insert("*".into(), Value::String("deny".into()));
     for name in permissions {
         permission.insert(name.clone(), Value::String("allow".into()));
     }
+    if definition.kind == ArtifactKind::Bench {
+        permission.insert("bash".into(), Value::String("allow".into()));
+    }
     permission.insert("glob".into(), Value::String("allow".into()));
     permission.insert("grep".into(), Value::String("deny".into()));
 
     let mut readable = BTreeSet::new();
-    if let Some(goal) = &definition.goal {
-        add_path_patterns(&mut readable, goal);
-    }
     for path in plan
         .artifact_inputs(artifact)
         .iter()
@@ -59,11 +55,51 @@ pub fn profile(plan: &Plan, artifact: &ArtifactName) -> AgentProfile {
 
     let permission = serde_json::to_string(&permission).expect("JSON map is serializable");
     let content = format!(
-        "---\ndescription: \"Labflow/v{TEMPLATE_VERSION} {role_kind} {role_name}\"\nmode: subagent\npermission: {permission}\n---\n\n你是{role_kind} {role_name}，请按照指令要求完成任务。\n"
+        "---\ndescription: \"Labflow/v{TEMPLATE_VERSION} 实验员 {role_name}\"\nmode: subagent\npermission: {permission}\n---\n\n你是实验员 {role_name}，请按照指令要求完成任务。\n"
     );
     let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
     AgentProfile {
         id: format!("{role_name}.{hash}"),
+        content,
+    }
+}
+
+pub fn respondent_profile(artifact: &ArtifactName, bench: &Bench) -> AgentProfile {
+    let mut permission = Map::new();
+    permission.insert("*".into(), Value::String("deny".into()));
+    permission.insert("glob".into(), Value::String("allow".into()));
+    permission.insert("grep".into(), Value::String("deny".into()));
+
+    let mut readable = BTreeSet::new();
+    for path in bench
+        .public_knowledge
+        .iter()
+        .chain(&bench.permissions.read)
+        .chain(&bench.permissions.write)
+    {
+        add_path_patterns(&mut readable, path);
+    }
+    permission.insert("read".into(), path_rules(readable));
+
+    let mut writable = BTreeSet::new();
+    for path in &bench.permissions.write {
+        add_path_patterns(&mut writable, path);
+    }
+    permission.insert("edit".into(), path_rules(writable));
+    let mut bash = Map::new();
+    bash.insert("*".into(), Value::String("deny".into()));
+    for command in &bench.permissions.commands {
+        bash.insert(command.clone(), Value::String("allow".into()));
+    }
+    permission.insert("bash".into(), Value::Object(bash));
+
+    let permission = serde_json::to_string(&permission).expect("JSON map is serializable");
+    let content = format!(
+        "---\ndescription: \"Labflow/v{TEMPLATE_VERSION} benchmark respondent {artifact}\"\nmode: primary\npermission: {permission}\n---\n\n你是评测中的被测 Agent。请只依据公开背景、对话中收到的问题和允许使用的工具完成解题。\n"
+    );
+    let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+    AgentProfile {
+        id: format!("{}.{}", artifact.as_str().replace('.', "-"), hash),
         content,
     }
 }
@@ -126,6 +162,12 @@ fn materialize_one(directory: &Path, profile: &AgentProfile) -> Result<()> {
     result.with_context(|| format!("failed to materialize agent `{}`", profile.id))
 }
 
+pub fn materialize_profile(root: &Path, profile: &AgentProfile) -> Result<()> {
+    let directory = root.join(".opencode/agents");
+    fs::create_dir_all(&directory)?;
+    materialize_one(&directory, profile)
+}
+
 fn verify(path: &Path, profile: &AgentProfile) -> Result<()> {
     let existing = fs::read(path)?;
     if existing != profile.content.as_bytes() {
@@ -150,7 +192,6 @@ mod tests {
         let plan = Plan::parse(
             r#"version = 1
 [roles.a1]
-kind = "lab-worker"
 permissions = ["webfetch"]
 [artifacts."first.a1"]
 goal = "goal.md"
@@ -167,9 +208,7 @@ permissions = ["bash"]
         assert!(first.content.contains(r#""glob":"allow""#));
         assert!(first.content.contains(r#""grep":"deny""#));
         assert!(first.content.contains(r#""webfetch":"allow""#));
-        assert!(first.content.contains(
-            r#""read":{"*":"deny","generated":"allow","generated/*":"allow","goal.md":"allow","input.md":"allow","output.md":"allow","references":"allow","references/*":"allow"}"#
-        ));
+        assert!(first.content.contains(r#""goal.md":"allow""#));
         assert!(first.content.contains(
             r#""edit":{"*":"deny","generated":"allow","generated/*":"allow","output.md":"allow"}"#
         ));

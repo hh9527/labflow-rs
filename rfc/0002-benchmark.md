@@ -1,5 +1,10 @@
 # RFC 0002：被测 Agent 评测协议
 
+> 修订说明（2026-09-03）：RFC 0003 将本 RFC 的顶层 `[benchmark.*]` 收入
+> `kind = "bench"` 的 `[artifacts.*]`，删除显式 respondent，并改用完整 artifact
+> 名作为 CLI 参数。本文的对话协议与 records schema 继续有效，计划表面以
+> RFC 0003 为准。
+
 - 状态：草案
 - 创建日期：2026-09-02
 
