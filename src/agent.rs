@@ -24,6 +24,10 @@ pub const OPENCODE_ENV_DIR: &str = ".labflow/oc-env";
 pub const PLAN_ENV_ARTIFACT: &str = "_plan-env";
 pub const CURRENT_ENV_ARTIFACT: &str = "_current-env";
 
+pub fn bench_context_path(bench: &Bench) -> String {
+    format!(".labflow/benchmarks/{}.context.json", bench.name.as_str())
+}
+
 pub fn profile(plan: &Plan, artifact: &ArtifactName) -> AgentProfile {
     let definition = &plan.artifacts[artifact];
     let role_name = artifact.role().expect("agent profiles belong to roles");
@@ -112,6 +116,7 @@ pub fn respondent_profile(artifact: &ArtifactName, bench: &Bench) -> AgentProfil
     {
         add_path_patterns(&mut readable, path);
     }
+    readable.insert(bench_context_path(bench));
     permission.insert("read".into(), path_rules(readable));
 
     let mut writable = BTreeSet::new();

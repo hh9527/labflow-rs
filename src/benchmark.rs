@@ -210,6 +210,22 @@ struct PermissionRule {
     action: &'static str,
 }
 
+#[derive(Serialize)]
+struct PublicContext<'a> {
+    version: u8,
+    artifact: &'a str,
+    round_id: i64,
+    question_id: &'a str,
+    turn_index: u8,
+    messages: Vec<PublicMessage>,
+}
+
+#[derive(Serialize)]
+struct PublicMessage {
+    kind: &'static str,
+    text: String,
+}
+
 impl Event {
     fn reduce(self, state: &mut State) -> Result<Vec<Effect>> {
         match self {
@@ -474,6 +490,7 @@ impl Effect {
         match self {
             Self::LoadInputs => Ok(Some(Event::InputsLoaded(load_questions(&context)?))),
             Self::CreateRound(questions) => {
+                remove_public_context(&context)?;
                 let mut connection = Connection::open(&context.records)?;
                 let now = now()?;
                 let configuration_revision = format!(
@@ -609,6 +626,7 @@ impl Effect {
                     params![round_id, question.id],
                 )?;
                 transaction.commit()?;
+                write_public_context(&context, round_id, &question, prompt, clarification)?;
                 let submission = context
                     .client
                     .post(format!(
@@ -628,6 +646,7 @@ impl Effect {
                     .await
                     .and_then(reqwest::Response::error_for_status);
                 if let Err(error) = submission {
+                    remove_public_context(&context)?;
                     let connection = Connection::open(&context.records)?;
                     if clarification {
                         connection.execute(
@@ -784,6 +803,7 @@ impl Effect {
                     params![round_id, question_id],
                 )?;
                 transaction.commit()?;
+                remove_public_context(&context)?;
                 Ok(Some(Event::Archived))
             }
             Self::DeleteSession { session_id, after } => {
@@ -801,6 +821,7 @@ impl Effect {
                     "UPDATE bench_round SET status = 'committed', finished_at = ?1, session_id = NULL WHERE id = ?2 AND status = 'current'",
                     params![now()?, round_id],
                 )?;
+                remove_public_context(&context)?;
                 Ok(Some(Event::RoundCommitted))
             }
             Self::Output(value) => {
@@ -981,6 +1002,11 @@ fn respondent_permissions(benchmark: &Bench) -> Vec<PermissionRule> {
             rules.push(rule("read", &pattern, "allow"));
         }
     }
+    rules.push(rule(
+        "read",
+        &crate::agent::bench_context_path(benchmark),
+        "allow",
+    ));
     for path in &benchmark.permissions.write {
         for pattern in path_patterns(path) {
             rules.push(rule("edit", &pattern, "allow"));
@@ -990,6 +1016,67 @@ fn respondent_permissions(benchmark: &Bench) -> Vec<PermissionRule> {
         rules.push(rule("bash", command, "allow"));
     }
     rules
+}
+
+fn public_context_path(context: &ContextData) -> PathBuf {
+    context
+        .root
+        .join(crate::agent::bench_context_path(&context.benchmark))
+}
+
+fn write_public_context(
+    context: &ContextData,
+    round_id: i64,
+    question: &Question,
+    prompt: String,
+    clarification: bool,
+) -> Result<()> {
+    let path = public_context_path(context);
+    let mut messages = vec![PublicMessage {
+        kind: "question",
+        text: question.q.clone(),
+    }];
+    if clarification {
+        let connection = Connection::open(&context.records)?;
+        let mut statement = connection.prepare(
+            "SELECT q FROM turn WHERE bench_round_id = ?1 AND question_id = ?2 AND turn_index > 0 AND turn_index < ?3 ORDER BY turn_index",
+        )?;
+        let previous = statement
+            .query_map(
+                params![round_id, question.id, question.clarifications],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        messages.extend(previous.into_iter().map(|text| PublicMessage {
+            kind: "clarification",
+            text,
+        }));
+        messages.push(PublicMessage {
+            kind: "clarification",
+            text: prompt,
+        });
+    }
+    let value = PublicContext {
+        version: 1,
+        artifact: &context.name,
+        round_id,
+        question_id: &question.id,
+        turn_index: question.clarifications,
+        messages,
+    };
+    fs::create_dir_all(path.parent().expect("context path has parent"))?;
+    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    fs::write(&temporary, serde_json::to_vec_pretty(&value)?)?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn remove_public_context(context: &ContextData) -> Result<()> {
+    match fs::remove_file(public_context_path(context)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn rule(permission: &str, pattern: &str, action: &'static str) -> PermissionRule {

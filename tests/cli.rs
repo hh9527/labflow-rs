@@ -542,6 +542,26 @@ commands = ["just verify"]
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["status"],
         "running"
     );
+    let context_path = directory
+        .path()
+        .join(".labflow/benchmarks/solver.context.json");
+    let public_context: serde_json::Value =
+        serde_json::from_slice(&fs::read(&context_path).unwrap()).unwrap();
+    assert_eq!(
+        public_context,
+        serde_json::json!({
+            "version": 1,
+            "artifact": "bench-solver.challenger",
+            "round_id": 1,
+            "question_id": "q1",
+            "turn_index": 0,
+            "messages": [{"kind": "question", "text": "solve it"}]
+        })
+    );
+    let public_bytes = fs::read_to_string(&context_path).unwrap();
+    assert!(!public_bytes.contains("hidden hint"));
+    assert!(!public_bytes.contains("reference"));
+    assert!(!public_bytes.contains("logic"));
     for arguments in [
         vec!["challenge", "archive", "bench-solver.challenger"],
         vec![
@@ -584,6 +604,16 @@ commands = ["just verify"]
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["status"],
         "running"
     );
+    let public_context: serde_json::Value =
+        serde_json::from_slice(&fs::read(&context_path).unwrap()).unwrap();
+    assert_eq!(
+        public_context["messages"],
+        serde_json::json!([
+            {"kind": "question", "text": "solve it"},
+            {"kind": "clarification", "text": "use the public rule"}
+        ])
+    );
+    assert_eq!(public_context["turn_index"], 1);
     let output = invoke(&["challenge", "poll-reply", "bench-solver.challenger"]);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["reply"],
@@ -594,6 +624,7 @@ commands = ["just verify"]
             .status
             .success()
     );
+    assert!(!context_path.exists());
     let output = invoke(&["challenge", "next", "bench-solver.challenger"]);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
@@ -613,6 +644,17 @@ commands = ["just verify"]
         session["agent"]
             .as_str()
             .is_some_and(|agent| agent.starts_with("bench-solver-challenger."))
+    );
+    assert!(
+        session["permission"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| {
+                rule["permission"] == "read"
+                    && rule["pattern"] == ".labflow/benchmarks/solver.context.json"
+                    && rule["action"] == "allow"
+            })
     );
     assert!(directory.path().join("benchmark-deleted").is_file());
     let records =
