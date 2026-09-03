@@ -275,6 +275,7 @@ async fn run_generation(
         client,
         backend_url,
         root.clone(),
+        databases,
         event_tx.clone(),
         shutdown_rx.clone(),
     );
@@ -416,7 +417,6 @@ async fn apply_effect(effect: Effect, context: Arc<EffectContext>) -> Result<()>
                         "failed",
                         None,
                         None,
-                        &[],
                     );
                     Event::EffectFailed {
                         artifact: Some(artifact),
@@ -652,26 +652,9 @@ impl Effect {
                 let value: Value = response.json().await?;
                 let content = response_text(&value);
                 let finished_at = system_time_micros(SystemTime::now());
-                let parts = crate::opencode::turn_parts(
-                    &context.client,
-                    &context.backend_url,
-                    &context.root,
-                    &session_id,
-                    &value,
-                    None,
-                )
-                .await;
-                let actions = response_actions(&parts, started_at, finished_at);
-                let longest_reasoning_ms = actions
-                    .iter()
-                    .filter(|action| action.kind == "reasoning")
-                    .filter_map(|action| {
-                        action
-                            .finished_at
-                            .map(|end| end.saturating_sub(action.started_at).max(0) as u64)
-                    })
-                    .max()
-                    .unwrap_or_default();
+                let longest_reasoning_ms = context
+                    .databases
+                    .longest_timeline_reasoning_ms(request_id)?;
                 let upstream_turn_id = value["info"]["id"].as_str();
                 context.databases.finish_timeline_turn(
                     request_id,
@@ -682,7 +665,6 @@ impl Effect {
                     },
                     Some(utf8_prefix(&content, 60)),
                     upstream_turn_id,
-                    &actions,
                 )?;
                 context
                     .event_tx
@@ -892,46 +874,87 @@ fn response_text(value: &Value) -> String {
         .join("\n")
 }
 
-fn response_actions(
-    parts: &[Value],
-    started_at: Timestamp,
-    finished_at: Timestamp,
-) -> Vec<TimelineAction> {
-    parts
-        .iter()
-        .filter_map(|part| {
-            let source_kind = part["tool"].as_str().or_else(|| part["type"].as_str())?;
-            let kind = match source_kind.to_ascii_lowercase().as_str() {
-                "reasoning" => "reasoning",
-                "text" => "text",
-                "read" => "read",
-                "edit" | "apply_patch" => "edit",
-                "write" => "write",
-                "glob" => "glob",
-                "bash" => "bash",
-                _ if part["type"] == "tool" => "other-tool",
-                _ => return None,
-            };
+fn extract_timeline_action(value: &Value) -> Option<TimelineAction> {
+    if value["type"] != "message.part.updated" {
+        return None;
+    }
+    let properties = &value["properties"];
+    let part = &properties["part"];
+    let session_id = properties["sessionID"]
+        .as_str()
+        .or_else(|| part["sessionID"].as_str())?
+        .to_owned();
+    let message_id = part["messageID"].as_str()?.to_owned();
+    let part_id = part["id"].as_str()?.to_owned();
+    let observed_at = properties["time"].as_i64()?.saturating_mul(1_000);
+    let (kind, subject, started_at, finished_at, result) = match part["type"].as_str()? {
+        kind @ ("reasoning" | "text") => {
+            let started_at = part["time"]["start"]
+                .as_i64()
+                .map(|value| value.saturating_mul(1_000))
+                .unwrap_or(observed_at);
+            let finished_at = part["time"]["end"]
+                .as_i64()
+                .map(|value| value.saturating_mul(1_000));
+            (
+                kind,
+                None,
+                started_at,
+                finished_at,
+                finished_at.map(|_| "succeeded"),
+            )
+        }
+        "tool" => {
             let state = &part["state"];
-            let time = if state["time"].is_object() {
-                &state["time"]
-            } else {
-                &part["time"]
+            let status = state["status"].as_str()?;
+            if status == "running" {
+                return None;
+            }
+            let tool = part["tool"].as_str().unwrap_or("other-tool");
+            let kind = normalize_tool_kind(tool);
+            let started_at = state["time"]["start"]
+                .as_i64()
+                .map(|value| value.saturating_mul(1_000))
+                .unwrap_or(observed_at);
+            let finished_at = state["time"]["end"]
+                .as_i64()
+                .map(|value| value.saturating_mul(1_000));
+            let result = match status {
+                "completed" => Some("succeeded"),
+                "error" => Some("failed"),
+                _ => None,
             };
-            let status = state["status"].as_str();
-            let result = status
-                .and_then(normalize_action_result)
-                .or_else(|| (!state.is_object()).then_some("succeeded"));
-            let subject = action_subject(kind, &state["input"]);
-            Some(TimelineAction {
-                kind: kind.to_owned(),
-                subject,
-                started_at: time["start"].as_i64().unwrap_or(started_at),
-                finished_at: time["end"].as_i64().or_else(|| result.map(|_| finished_at)),
-                result: result.map(str::to_owned),
-            })
-        })
-        .collect()
+            (
+                kind,
+                action_subject(kind, &state["input"]),
+                started_at,
+                finished_at,
+                result,
+            )
+        }
+        _ => return None,
+    };
+    Some(TimelineAction {
+        session_id,
+        message_id,
+        part_id,
+        kind: kind.to_owned(),
+        subject,
+        started_at,
+        finished_at,
+        result: result.map(str::to_owned),
+    })
+}
+
+fn normalize_tool_kind(tool: &str) -> &'static str {
+    match tool.to_ascii_lowercase().as_str() {
+        "read" => "read",
+        "edit" | "apply_patch" => "edit",
+        "write" => "write",
+        "glob" => "glob",
+        "bash" => "bash",
+        _ => "other-tool",
+    }
 }
 
 fn action_subject(kind: &str, input: &Value) -> Option<String> {
@@ -945,15 +968,6 @@ fn action_subject(kind: &str, input: &Value) -> Option<String> {
         .iter()
         .find_map(|field| input[*field].as_str())
         .map(str::to_owned)
-}
-
-fn normalize_action_result(status: &str) -> Option<&'static str> {
-    match status {
-        "completed" | "success" | "succeeded" => Some("succeeded"),
-        "error" | "failed" => Some("failed"),
-        "cancelled" | "interrupted" => Some("interrupted"),
-        _ => None,
-    }
 }
 
 fn utf8_prefix(value: &str, limit: usize) -> &str {
@@ -980,6 +994,7 @@ fn spawn_opencode_event_collector(
     client: Client,
     backend_url: Arc<String>,
     root: PathBuf,
+    databases: Databases,
     event_tx: mpsc::Sender<Event>,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -1006,9 +1021,15 @@ fn spawn_opencode_event_collector(
                                 buffer.drain(..end + 2);
                                 for data in frame.lines().filter_map(|line| line.strip_prefix("data: ")) {
                                     if let Ok(value) = serde_json::from_str::<Value>(data)
-                                        && let Some(event) = extract_opencode_event(&value)
                                     {
-                                        let _ = event_tx.send(event).await;
+                                        if let Some(action) = extract_timeline_action(&value)
+                                            && let Err(error) = databases.record_timeline_action(&action)
+                                        {
+                                            eprintln!("failed to record OpenCode timeline event: {error:#}");
+                                        }
+                                        if let Some(event) = extract_opencode_event(&value) {
+                                            let _ = event_tx.send(event).await;
+                                        }
                                     }
                                 }
                             }

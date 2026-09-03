@@ -26,6 +26,9 @@ pub struct Databases {
 
 #[derive(Clone, Debug)]
 pub struct TimelineAction {
+    pub session_id: String,
+    pub message_id: String,
+    pub part_id: String,
     pub kind: String,
     pub subject: Option<String>,
     pub started_at: Timestamp,
@@ -72,7 +75,7 @@ impl Databases {
         )?;
         let timeline = Connection::open(&databases.timeline)?;
         let version: i64 = timeline.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != 2 {
+        if version != 0 && version < 2 {
             timeline.execute_batch(
                 "DROP TABLE IF EXISTS records;
                  DROP TABLE IF EXISTS artifact_turn;
@@ -101,9 +104,25 @@ impl Databases {
                started_at INTEGER NOT NULL,
                finished_at INTEGER,
                result TEXT,
+               upstream_message_id TEXT,
+               upstream_part_id TEXT,
                PRIMARY KEY(artifact_turn_id, action_index)
              );
-             PRAGMA user_version = 2;",
+             ",
+        )?;
+        if version == 2 {
+            timeline.execute_batch(
+                "ALTER TABLE turn_action ADD COLUMN upstream_message_id TEXT;
+                 ALTER TABLE turn_action ADD COLUMN upstream_part_id TEXT;
+                 ",
+            )?;
+        } else if version > 3 {
+            anyhow::bail!("timeline database version {version} is newer than supported version 3");
+        }
+        timeline.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS turn_action_upstream_part
+               ON turn_action(artifact_turn_id, upstream_part_id);
+             PRAGMA user_version = 3;",
         )?;
         Ok(databases)
     }
@@ -304,21 +323,75 @@ impl Databases {
         result: &str,
         reply_prefix: Option<&str>,
         upstream_turn_id: Option<&str>,
-        actions: &[TimelineAction],
     ) -> Result<()> {
-        let mut connection = Connection::open(&self.timeline)?;
-        let transaction = connection.transaction()?;
-        transaction.execute(
+        Connection::open(&self.timeline)?.execute(
             "UPDATE artifact_turn SET finished_at = ?1, result = ?2,
              reply_prefix = COALESCE(?3, reply_prefix), upstream_turn_id = COALESCE(?4, upstream_turn_id)
              WHERE id = ?5",
             params![finished_at, result, reply_prefix, upstream_turn_id, id],
         )?;
-        for (index, action) in actions.iter().enumerate() {
+        Ok(())
+    }
+
+    pub fn record_timeline_action(&self, action: &TimelineAction) -> Result<()> {
+        let mut connection = Connection::open(&self.timeline)?;
+        let transaction = connection.transaction()?;
+        let turn_id = transaction
+            .query_row(
+                "SELECT id FROM artifact_turn
+                 WHERE upstream_session_id = ?1
+                   AND started_at <= ?2
+                   AND (finished_at IS NULL OR finished_at >= ?2)
+                 ORDER BY started_at DESC LIMIT 1",
+                params![action.session_id, action.started_at],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(turn_id) = turn_id else {
+            return Ok(());
+        };
+        let updated = transaction.execute(
+            "UPDATE turn_action SET
+               upstream_message_id = ?1,
+               kind = CASE WHEN kind = 'unknown' THEN ?2 ELSE kind END,
+               subject = COALESCE(subject, ?3),
+               started_at = min(started_at, ?4),
+               finished_at = COALESCE(?5, finished_at),
+               result = COALESCE(?6, result)
+             WHERE artifact_turn_id = ?7 AND upstream_part_id = ?8",
+            params![
+                action.message_id,
+                action.kind,
+                action.subject,
+                action.started_at,
+                action.finished_at,
+                action.result,
+                turn_id,
+                action.part_id,
+            ],
+        )?;
+        if updated == 0 {
+            let action_index: i64 = transaction.query_row(
+                "SELECT COALESCE(max(action_index) + 1, 0) FROM turn_action WHERE artifact_turn_id = ?1",
+                [turn_id],
+                |row| row.get(0),
+            )?;
             transaction.execute(
-                "INSERT INTO turn_action(artifact_turn_id, action_index, kind, subject, started_at, finished_at, result)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![id, index as i64, action.kind, action.subject, action.started_at, action.finished_at, action.result],
+                "INSERT INTO turn_action(
+                   artifact_turn_id, action_index, kind, subject, started_at, finished_at, result,
+                   upstream_message_id, upstream_part_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    turn_id,
+                    action_index,
+                    action.kind,
+                    action.subject,
+                    action.started_at,
+                    action.finished_at,
+                    action.result,
+                    action.message_id,
+                    action.part_id,
+                ],
             )?;
         }
         transaction.commit()?;
@@ -342,6 +415,16 @@ impl Databases {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn longest_timeline_reasoning_ms(&self, id: u64) -> Result<u64> {
+        let duration: Option<i64> = Connection::open(&self.timeline)?.query_row(
+            "SELECT max(finished_at - started_at) FROM turn_action
+             WHERE artifact_turn_id = ?1 AND kind = 'reasoning' AND finished_at IS NOT NULL",
+            [id],
+            |row| row.get(0),
+        )?;
+        Ok(duration.unwrap_or_default().max(0) as u64 / 1_000)
     }
 }
 
@@ -404,5 +487,55 @@ mod tests {
         };
         databases.persist_host_tasks(&host_tasks).unwrap();
         assert_eq!(read_host_tasks(directory.path()).unwrap(), host_tasks);
+    }
+
+    #[test]
+    fn migrates_timeline_v2_without_losing_actions() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join(".labflow")).unwrap();
+        let path = directory.path().join(TIMELINE_DB);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE artifact_turn (
+               id INTEGER PRIMARY KEY, artifact TEXT NOT NULL, iteration INTEGER NOT NULL,
+               started_at INTEGER NOT NULL, finished_at INTEGER, result TEXT, reply_prefix TEXT,
+               upstream_session_id TEXT NOT NULL, upstream_turn_id TEXT
+             );
+             CREATE TABLE turn_action (
+               artifact_turn_id INTEGER NOT NULL, action_index INTEGER NOT NULL, kind TEXT NOT NULL,
+               subject TEXT, started_at INTEGER NOT NULL, finished_at INTEGER, result TEXT,
+               PRIMARY KEY(artifact_turn_id, action_index)
+             );
+             INSERT INTO turn_action VALUES (1, 0, 'text', NULL, 10, 11, 'succeeded');
+             PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        drop(connection);
+
+        Databases::initialize(directory.path()).unwrap();
+        let connection = Connection::open(path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM turn_action", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let columns = connection
+            .prepare("PRAGMA table_info(turn_action)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(columns.contains(&"upstream_message_id".into()));
+        assert!(columns.contains(&"upstream_part_id".into()));
     }
 }

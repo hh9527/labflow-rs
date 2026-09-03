@@ -2,11 +2,13 @@
 import argparse
 import json
 import os
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 session_count = 0
 benchmark_session = None
 benchmark_message = None
+event_frames = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -57,17 +59,29 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/session/status?"):
             self.send_json({})
         elif self.path.startswith("/event"):
-            body = b'data: {"type":"server.connected","properties":{}}\n\n'
+            global event_frames
+            for _ in range(50):
+                if event_frames:
+                    break
+                time.sleep(0.01)
+            events = event_frames
+            event_frames = []
+            body = "".join(f"data: {json.dumps(event)}\n\n" for event in events).encode()
+            if not body:
+                body = b'data: {"type":"server.connected","properties":{}}\n\n'
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
             self.send_header("content-length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except BrokenPipeError:
+                pass
         else:
             self.send_error(404)
 
     def do_POST(self):
-        global session_count, benchmark_session, benchmark_message
+        global session_count, benchmark_session, benchmark_message, event_frames
         length = int(self.headers.get("content-length", "0"))
         body = json.loads(self.rfile.read(length) or b"{}")
         if self.path.startswith("/session?"):
@@ -105,6 +119,21 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with open(os.path.join(os.getcwd(), "answer.md"), "w", encoding="utf-8") as output:
                 output.write("fake answer\n")
+            event_time = int(time.time() * 1000)
+            event_frames.extend([
+                {"type": "message.part.updated", "properties": {"time": event_time, "sessionID": "ses_worker", "part": {"id": "reason_1", "messageID": "msg_fake", "type": "reasoning", "text": "", "time": {"start": event_time}}}},
+                {"type": "message.part.updated", "properties": {"time": event_time + 1, "sessionID": "ses_worker", "part": {"id": "reason_1", "messageID": "msg_fake", "type": "reasoning", "text": "reason", "time": {"start": event_time, "end": event_time + 1}}}},
+                {"type": "message.part.updated", "properties": {"time": event_time + 2, "sessionID": "ses_worker", "part": {"id": "call_1", "messageID": "msg_fake", "type": "tool", "tool": "read", "state": {"status": "pending", "input": {}}}}},
+                {"type": "message.part.updated", "properties": {"time": event_time + 2, "sessionID": "ses_worker", "part": {"id": "call_1", "messageID": "msg_fake", "type": "tool", "tool": "read", "state": {"status": "running", "input": {"filePath": "goal.md"}, "time": {"start": event_time + 2}}}}},
+                {"type": "message.part.updated", "properties": {"time": event_time + 3, "sessionID": "ses_worker", "part": {"id": "call_1", "messageID": "msg_fake", "type": "tool", "tool": "read", "state": {"status": "completed", "input": {"filePath": "goal.md"}, "time": {"start": event_time + 2, "end": event_time + 3}}}}},
+                {"type": "message.part.updated", "properties": {"time": event_time + 4, "sessionID": "ses_worker", "part": {"id": "text_1", "messageID": "msg_fake", "type": "text", "text": "", "time": {"start": event_time + 4}}}},
+                {"type": "message.part.updated", "properties": {"time": event_time + 5, "sessionID": "ses_worker", "part": {"id": "text_1", "messageID": "msg_fake", "type": "text", "text": "完成任务。", "time": {"start": event_time + 4, "end": event_time + 5}}}},
+            ])
+            for _ in range(50):
+                if not event_frames:
+                    break
+                time.sleep(0.01)
+            time.sleep(0.02)
             self.send_json({
                 "info": {"id": "msg_fake", "parentID": "msg_worker_user"},
                 "parts": [
