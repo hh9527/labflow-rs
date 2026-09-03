@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,6 +31,8 @@ struct Question {
     id: String,
     q: String,
     k: String,
+    reference_answer: Option<String>,
+    tags: Vec<String>,
     status: String,
     clarifications: u8,
 }
@@ -482,10 +484,23 @@ impl Effect {
                 let round_id = transaction.last_insert_rowid();
                 for question in &questions {
                     transaction.execute(
-                        "INSERT INTO question(bench_round_id, ordinal, question_id, k, status)
-                         VALUES (?1, ?2, ?3, ?4, 'pending')",
-                        params![round_id, question.ordinal, question.id, question.k],
+                        "INSERT INTO question(bench_round_id, ordinal, question_id, k, reference_answer, status)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
+                        params![
+                            round_id,
+                            question.ordinal,
+                            question.id,
+                            question.k,
+                            question.reference_answer
+                        ],
                     )?;
+                    for tag in &question.tags {
+                        transaction.execute(
+                            "INSERT INTO question_tag(bench_round_id, question_id, tag)
+                             VALUES (?1, ?2, ?3)",
+                            params![round_id, question.id, tag],
+                        )?;
+                    }
                     transaction.execute(
                         "INSERT INTO turn(bench_round_id, question_id, turn_index, is_last_turn, q)
                          VALUES (?1, ?2, 0, 0, ?3)",
@@ -699,13 +714,14 @@ impl Effect {
 fn initialize(path: &Path) -> Result<()> {
     let connection = Connection::open(path)?;
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != 2 {
+    if version != 3 {
         connection.execute_batch(
             "DROP TABLE IF EXISTS question_turns;
              DROP TABLE IF EXISTS round_questions;
              DROP TABLE IF EXISTS bench_rounds;
              DROP TABLE IF EXISTS action;
              DROP TABLE IF EXISTS turn;
+             DROP TABLE IF EXISTS question_tag;
              DROP TABLE IF EXISTS question;
              DROP TABLE IF EXISTS bench_round;",
         )?;
@@ -720,8 +736,12 @@ fn initialize(path: &Path) -> Result<()> {
          CREATE UNIQUE INDEX IF NOT EXISTS one_current_round ON bench_round(status) WHERE status = 'current';
          CREATE TABLE IF NOT EXISTS question (
            bench_round_id INTEGER NOT NULL, ordinal INTEGER NOT NULL, question_id TEXT NOT NULL,
-           k TEXT NOT NULL, status TEXT NOT NULL, archived_at INTEGER,
+           k TEXT NOT NULL, reference_answer TEXT, status TEXT NOT NULL, archived_at INTEGER,
            PRIMARY KEY(bench_round_id, question_id)
+         );
+         CREATE TABLE IF NOT EXISTS question_tag (
+           bench_round_id INTEGER NOT NULL, question_id TEXT NOT NULL, tag TEXT NOT NULL,
+           PRIMARY KEY(bench_round_id, question_id, tag)
          );
          CREATE TABLE IF NOT EXISTS turn (
            bench_round_id INTEGER NOT NULL, question_id TEXT NOT NULL, turn_index INTEGER NOT NULL,
@@ -736,7 +756,7 @@ fn initialize(path: &Path) -> Result<()> {
            started_at INTEGER NOT NULL, finished_at INTEGER, result TEXT,
            PRIMARY KEY(bench_round_id, question_id, turn_index, action_index)
          );
-         PRAGMA user_version = 2;",
+         PRAGMA user_version = 3;",
     )?;
     Ok(())
 }
@@ -754,7 +774,7 @@ fn restore(path: &Path) -> Result<State> {
         return Ok(State::default());
     };
     let mut statement = connection.prepare(
-        "SELECT qn.ordinal, qn.question_id, t.q, qn.k, qn.status,
+        "SELECT qn.ordinal, qn.question_id, t.q, qn.k, qn.reference_answer, qn.status,
                 COALESCE((SELECT max(turn_index) FROM turn WHERE bench_round_id = qn.bench_round_id AND question_id = qn.question_id), 0)
          FROM question qn JOIN turn t ON t.bench_round_id = qn.bench_round_id AND t.question_id = qn.question_id AND t.turn_index = 0
          WHERE qn.bench_round_id = ?1 ORDER BY qn.ordinal",
@@ -766,8 +786,10 @@ fn restore(path: &Path) -> Result<State> {
                 id: row.get(1)?,
                 q: row.get(2)?,
                 k: row.get(3)?,
-                status: row.get(4)?,
-                clarifications: row.get(5)?,
+                reference_answer: row.get(4)?,
+                tags: Vec::new(),
+                status: row.get(5)?,
+                clarifications: row.get(6)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -785,42 +807,46 @@ struct SourceQuestion {
     id: String,
     #[serde(rename = "Q")]
     q: String,
-    #[serde(rename = "K")]
+    #[serde(default, rename = "K")]
     k: String,
+    #[serde(default, rename = "R")]
+    reference_answer: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 fn load_questions(context: &ContextData) -> Result<Vec<Question>> {
     let source = fs::read_to_string(context.benchmark.source.resolve(&context.root))?;
-    let mut catalog = BTreeMap::new();
-    for (index, line) in source
+    let mut ids = BTreeSet::new();
+    source
         .lines()
         .enumerate()
         .filter(|(_, line)| !line.trim().is_empty())
-    {
-        let question: SourceQuestion = serde_json::from_str(line)
-            .with_context(|| format!("invalid challenge source line {}", index + 1))?;
-        if catalog.insert(question.id.clone(), question).is_some() {
-            bail!("duplicate question id in challenge source");
-        }
-    }
-    let ids = fs::read_to_string(context.benchmark.qlist.resolve(&context.root))?;
-    let mut seen = BTreeSet::new();
-    ids.lines()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .enumerate()
-        .map(|(ordinal, id)| {
-            if !seen.insert(id.to_owned()) {
-                bail!("duplicate question id `{id}`")
+        .map(|(ordinal, line)| {
+            let source: SourceQuestion = serde_json::from_str(line)
+                .with_context(|| format!("invalid challenge source line {}", ordinal + 1))?;
+            if source.id.trim().is_empty() {
+                bail!("question id on line {} cannot be empty", ordinal + 1);
             }
-            let source = catalog
-                .get(id)
-                .with_context(|| format!("unknown question id `{id}`"))?;
+            if !ids.insert(source.id.clone()) {
+                bail!("duplicate question id `{}`", source.id);
+            }
+            let mut tags = BTreeSet::new();
+            for tag in source.tags {
+                if tag.trim().is_empty() {
+                    bail!("question `{}` has an empty tag", source.id);
+                }
+                if !tags.insert(tag.clone()) {
+                    bail!("question `{}` has duplicate tag `{tag}`", source.id);
+                }
+            }
             Ok(Question {
                 ordinal: ordinal as i64,
-                id: id.to_owned(),
-                q: source.q.clone(),
-                k: source.k.clone(),
+                id: source.id,
+                q: source.q,
+                k: source.k,
+                reference_answer: source.reference_answer,
+                tags: tags.into_iter().collect(),
                 status: "pending".into(),
                 clarifications: 0,
             })

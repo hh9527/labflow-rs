@@ -61,7 +61,6 @@ pub enum ArtifactKind {
 pub struct Bench {
     pub name: BenchName,
     pub source: FilePath,
-    pub qlist: FilePath,
     #[serde(default, rename = "public-knowledge")]
     pub public_knowledge: Vec<AssetPath>,
     #[serde(default)]
@@ -352,7 +351,6 @@ impl Plan {
         }
         if let Some(bench) = &artifact.bench {
             inputs.push(bench.source.0.clone());
-            inputs.push(bench.qlist.0.clone());
             inputs.extend(bench.public_knowledge.iter().cloned());
         }
         inputs
@@ -575,7 +573,6 @@ kind = "bench"
 [artifacts."bench-solver.r".bench]
 name = "solver"
 source = "questions.jsonl"
-qlist = "questions.ids"
 "#,
         )
         .unwrap();
@@ -594,7 +591,7 @@ qlist = "questions.ids"
         )
         .is_err());
         assert!(Plan::parse(
-            "version = 1\n[roles.r]\n[artifacts.'bad.r']\nkind = 'bench'\nassets = ['a.db']\n[artifacts.'bad.r'.bench]\nname = 'bad'\nsource = 'q.jsonl'\nqlist = 'q.ids'\n"
+            "version = 1\n[roles.r]\n[artifacts.'bad.r']\nkind = 'bench'\nassets = ['a.db']\n[artifacts.'bad.r'.bench]\nname = 'bad'\nsource = 'q.jsonl'\n"
         )
         .is_err());
         let duplicate = r#"version = 1
@@ -604,13 +601,11 @@ kind = "bench"
 [artifacts."bench-one.r".bench]
 name = "shared"
 source = "q.jsonl"
-qlist = "q.ids"
 [artifacts."bench-two.r"]
 kind = "bench"
 [artifacts."bench-two.r".bench]
 name = "shared"
 source = "q.jsonl"
-qlist = "q.ids"
 "#;
         assert!(
             format!("{:#}", Plan::parse(duplicate).unwrap_err()).contains("duplicate bench name")

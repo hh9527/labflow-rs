@@ -400,7 +400,6 @@ kind = "bench"
 name = "solver"
 public-knowledge = ["public/"]
 source = "questions.jsonl"
-qlist = "questions.ids"
 [artifacts."bench-solver.challenger".bench.permissions]
 write = ["workspace/result.json"]
 commands = ["just verify"]
@@ -409,10 +408,9 @@ commands = ["just verify"]
     .unwrap();
     fs::write(
         directory.path().join("questions.jsonl"),
-        "{\"id\":\"q1\",\"Q\":\"solve it\",\"K\":\"hidden hint\"}\n",
+        "{\"id\":\"q1\",\"Q\":\"solve it\",\"K\":\"hidden hint\",\"R\":\"reference\",\"tags\":[\"logic\",\"hard\"]}\n",
     )
     .unwrap();
-    fs::write(directory.path().join("questions.ids"), "q1\n").unwrap();
     let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_opencode.py");
     let mut backend = Command::new("python3")
         .args([fake.to_str().unwrap(), "--port", &port.to_string()])
@@ -495,6 +493,20 @@ commands = ["just verify"]
     assert!(directory.path().join("benchmark-deleted").is_file());
     let records =
         Connection::open(directory.path().join(".labflow/benchmarks/solver.sqlite")).unwrap();
+    let reference: Option<String> = records
+        .query_row("SELECT reference_answer FROM question", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(reference.as_deref(), Some("reference"));
+    let tags = records
+        .prepare("SELECT tag FROM question_tag ORDER BY tag")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(tags, vec!["hard", "logic"]);
     assert_eq!(
         records
             .query_row("SELECT status FROM bench_round", [], |row| row

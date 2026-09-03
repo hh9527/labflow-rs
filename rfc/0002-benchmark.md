@@ -23,7 +23,6 @@ requires = ["system-active", "_ready.b1"]
 public-knowledge = ["knowledge/public/"]
 
 challenge.source = "datasets/questions.jsonl"
-challenge.questions = "datasets/round-1.ids"
 
 [benchmark."a.b1".respondent]
 read = []
@@ -40,25 +39,25 @@ worker artifact `bench-a.b1`，其唯一输出和检查项为 `records`。
 - `records` 必须是文件，表示该 benchmark 独立的追加式 SQLite 数据库；
 - `public-knowledge`、`respondent.read` 和 `respondent.write` 可以是文件或以
   `/` 结尾的目录；
-- `challenge.source` 和 `challenge.questions` 必须是文件。
+- `challenge.source` 必须是文件。
 
 自动生成的 `bench-<respondent>.<challenger-role>` 不能与显式 artifact 重名。
 `requires` 使用与普通 artifact 相同的依赖语义。
 
 ## 题目输入
 
-`challenge.source` 是 UTF-8 JSONL，每个非空行具有唯一的 `id`：
+当前计划表面只使用一个 UTF-8 JSONL `bench.source`。每个非空行具有唯一的
+`id`，文件行序就是本轮题目顺序：
 
 ```json
-{"id":"q1","Q":"问题一","K":"仅供 C 使用的澄清知识"}
+{"id":"q1","Q":"问题一","K":"仅供 C 使用的澄清知识","R":"参考答案","tags":["reasoning"]}
 ```
 
-`challenge.questions` 是 UTF-8 文本，每个非空行包含一个 ID。行首尾空白被
-移除，空行被忽略，不支持注释，不允许重复 ID。文件顺序是本轮题目顺序；
-每个 ID 必须在 source 中唯一存在。
+`Q` 必填；`K`、`R` 和 `tags` 可选。`R` 是仅供后续分析使用的参考答案，不由
+challenge CLI 返回，也不发送给被测 Agent。tags 必须是非空、无重复的字符串。
 
-`bench start` 将本轮 ID 及对应 Q、K 快照导入 records。后续命令不重新读取
-source，因此源文件在轮次运行期间变化也不会改变本轮内容。
+`bench start` 将 JSONL 中的整份题集及 Q、K、R、tags 快照导入 records。后续
+命令不重新读取 source，因此源文件在轮次运行期间变化也不会改变本轮内容。
 
 ## 信息与能力边界
 
@@ -86,7 +85,7 @@ labflow bench start <name>
 ```
 
 定位 `<name>` 的 records，创建状态为 `current` 的新 round，在同一事务中导入
-questions 文件列出的全部题目快照，并创建全新的 R session。成功返回：
+source 文件中的全部题目快照，并创建全新的 R session。成功返回：
 
 ```json
 {"round":"<round-id>"}
@@ -159,7 +158,10 @@ bench_round
   configuration_revision
 
 question
-  bench_round_id, question_id, ordinal, k, status, archived_at
+  bench_round_id, question_id, ordinal, k, reference_answer, status, archived_at
+
+question_tag
+  bench_round_id, question_id, tag
 
 turn
   bench_round_id, question_id, turn_index, is_last_turn,

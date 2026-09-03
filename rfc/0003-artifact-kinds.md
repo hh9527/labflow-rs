@@ -48,7 +48,6 @@ requires = ["system-active", "answer.a1"]
 [artifacts."bench-solver.a2".bench]
 name = "solver"
 source = "benchmark/questions.jsonl"
-qlist = "benchmark/round-1.ids"
 public-knowledge = ["benchmark/public/"]
 
 [artifacts."bench-solver.a2".bench.permissions]
@@ -120,7 +119,7 @@ Bench 将 RFC 0002 的顶层 `[benchmark.*]` 收入 artifact：
 - `bench.name` 必须符合 artifact part 命名规则，并且在整个计划中唯一；
 - records 固定派生为 `.labflow/benchmarks/<bench.name>.sqlite`；
 - `assets` 和 `check` 均不可配置，records 是 Labflow 管理的内部数据库；
-- `bench.source` 和 `bench.qlist` 必须是文件；
+- `bench.source` 必须是一个 JSONL 文件，其非空行按顺序构成本轮完整题集；
 - `bench.public-knowledge` 可以包含文件或以 `/` 结尾的目录；
 - `bench.permissions` 包含 `read`、`write` 和 `commands`。
 
@@ -137,7 +136,13 @@ labflow bench finish bench-solver.a2
 `.labflow/artifacts/bench-solver.a2` 仍是表示该次构建完成的名义制品文件，
 与追加保存所有历史轮次的 `.labflow/benchmarks/solver.sqlite` 相互独立。
 
-题目、轮次、澄清和 records schema 继续遵循 RFC 0002。`source`、`qlist` 和隐藏
+每行题目格式为 `{ id, Q, K?, R?, tags? }`。`id` 必须非空且在文件内唯一，
+`Q` 是题面，`K` 是可选澄清知识，`R` 是可选参考答案，`tags` 是默认空数组的
+非空、无重复字符串集合。`bench start` 按文件行序将整份题集快照到新 round；
+参考答案不由 challenge CLI 返回，也绝不发送给被测 Agent。数据库将它保存为
+`question.reference_answer`，并将标签规范化保存到 `question_tag`，供后续分析。
+
+题目、轮次、澄清和 records schema 继续遵循 RFC 0002。`source` 和隐藏
 知识只对 C 可见；R 只能通过对话取得 Q 和 C 基于公开背景及 K 编写的澄清。
 
 ### 自动派生 R

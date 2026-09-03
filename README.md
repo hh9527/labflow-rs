@@ -74,13 +74,16 @@ requires = ["answer.researcher"]
 [artifacts."bench-answer.evaluator".bench]
 name = "answer"
 source = "benchmark/questions.jsonl"
-qlist = "benchmark/current.ids"
 public-knowledge = ["benchmark/public/"]
 
 [artifacts."bench-answer.evaluator".bench.permissions]
 write = ["benchmark/workspace/"]
 commands = ["just verify"]
 ```
+
+`source` 是本轮完整、有序的 JSONL 题集，每行格式为
+`{"id":"q1","Q":"...","K":"...","R":"...","tags":["..."]}`；
+`K`、参考答案 `R` 和 `tags` 均可选。
 
 artifact 的角色始终是后缀，例如 `answer.researcher`。Host 可以通过 publish
 普通名称或 `!名称` 操作非 `_` 的实体 artifact；Learn artifact 和 `_blocked`
