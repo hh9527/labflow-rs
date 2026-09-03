@@ -157,22 +157,19 @@ pub async fn run(root: PathBuf, expected_supervisor_generation: Option<Timestamp
             match effect {
                 SupervisorControlEffect::LoadPlan { request_id } => {
                     let event = match Plan::load(&root) {
-                        Ok(plan) => {
-                            let profiles = crate::agent::profiles(&plan);
-                            match crate::agent::materialize(&root, &profiles) {
-                                Ok(()) => SupervisorControlEvent::PlanLoaded {
-                                    request_id,
-                                    plan: Arc::new(plan),
-                                },
-                                Err(error) => SupervisorControlEvent::PlanLoadFailed {
-                                    request_id,
-                                    generation: artifact_timestamp(
-                                        &ArtifactName::parse("system-plan")?.path(&root),
-                                    )?,
-                                    reason: format!("{error:#}"),
-                                },
-                            }
-                        }
+                        Ok(plan) => match prepare_opencode_environment(&root, &plan) {
+                            Ok(()) => SupervisorControlEvent::PlanLoaded {
+                                request_id,
+                                plan: Arc::new(plan),
+                            },
+                            Err(error) => SupervisorControlEvent::PlanLoadFailed {
+                                request_id,
+                                generation: artifact_timestamp(
+                                    &ArtifactName::parse("system-plan")?.path(&root),
+                                )?,
+                                reason: format!("{error:#}"),
+                            },
+                        },
                         Err(error) => SupervisorControlEvent::PlanLoadFailed {
                             request_id,
                             generation: artifact_timestamp(
@@ -223,6 +220,21 @@ pub async fn run(root: PathBuf, expected_supervisor_generation: Option<Timestamp
     }
 }
 
+fn prepare_opencode_environment(root: &Path, plan: &Plan) -> Result<()> {
+    if !ArtifactName::parse("system-active")?.path(root).is_file() {
+        return Ok(());
+    }
+    let revision = crate::agent::materialize_environment(root, plan)?;
+    let current = crate::agent::read_revision(
+        &ArtifactName::parse(crate::agent::CURRENT_ENV_ARTIFACT)?.path(root),
+    )?;
+    let backend = ArtifactName::parse("system-backend")?;
+    if current.as_deref() != Some(&revision) && backend.path(root).is_file() {
+        publish(root, &backend)?;
+    }
+    Ok(())
+}
+
 async fn run_generation(
     root: PathBuf,
     plan: Arc<Plan>,
@@ -253,6 +265,7 @@ async fn run_generation(
     let backend_health_handle = spawn_backend_health_monitor(
         client.clone(),
         backend_url.clone(),
+        root.clone(),
         event_tx.clone(),
         shutdown_rx.clone(),
     );
@@ -725,6 +738,7 @@ impl Effect {
 fn spawn_backend_health_monitor(
     client: Client,
     url: Arc<String>,
+    root: PathBuf,
     event_tx: mpsc::Sender<Event>,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -735,12 +749,14 @@ fn spawn_backend_health_monitor(
         loop {
             tokio::select! {
                 _ = poll.tick() => {
-                    let ready = client
-                        .get(format!("{url}/global/health"))
-                        .timeout(Duration::from_millis(200))
-                        .send()
-                        .await
-                        .is_ok_and(|response| response.status().is_success());
+                    let environment_ready = environment_revisions_match(&root).unwrap_or(false);
+                    let ready = environment_ready
+                        && client
+                            .get(format!("{url}/global/health"))
+                            .timeout(Duration::from_millis(200))
+                            .send()
+                            .await
+                            .is_ok_and(|response| response.status().is_success());
                     if previous != Some(ready) {
                         previous = Some(ready);
                         if event_tx.send(Event::BackendAvailabilityChanged { ready }).await.is_err() {
@@ -754,6 +770,16 @@ fn spawn_backend_health_monitor(
             }
         }
     })
+}
+
+fn environment_revisions_match(root: &Path) -> Result<bool> {
+    let plan = crate::agent::read_revision(
+        &ArtifactName::parse(crate::agent::PLAN_ENV_ARTIFACT)?.path(root),
+    )?;
+    let current = crate::agent::read_revision(
+        &ArtifactName::parse(crate::agent::CURRENT_ENV_ARTIFACT)?.path(root),
+    )?;
+    Ok(plan.is_some() && plan == current)
 }
 
 fn spawn_artifact_watcher(

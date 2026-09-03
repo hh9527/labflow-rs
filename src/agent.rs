@@ -20,6 +20,10 @@ pub struct AgentProfile {
     pub content: String,
 }
 
+pub const OPENCODE_ENV_DIR: &str = ".labflow/oc-env";
+pub const PLAN_ENV_ARTIFACT: &str = "_plan-env";
+pub const CURRENT_ENV_ARTIFACT: &str = "_current-env";
+
 pub fn profile(plan: &Plan, artifact: &ArtifactName) -> AgentProfile {
     let definition = &plan.artifacts[artifact];
     let role_name = artifact.role().expect("agent profiles belong to roles");
@@ -31,8 +35,16 @@ pub fn profile(plan: &Plan, artifact: &ArtifactName) -> AgentProfile {
     for name in permissions {
         permission.insert(name.clone(), Value::String("allow".into()));
     }
-    if definition.kind == ArtifactKind::Bench {
-        permission.insert("bash".into(), bench_commands(artifact));
+    let commands = if definition.kind == ArtifactKind::Bench {
+        bench_commands(artifact)
+            .into_iter()
+            .chain(definition.commands.iter().cloned())
+            .collect()
+    } else {
+        definition.commands.clone()
+    };
+    if !commands.is_empty() {
+        permission.insert("bash".into(), command_rules(commands));
     }
     permission.insert("glob".into(), Value::String("allow".into()));
     permission.insert("grep".into(), Value::String("deny".into()));
@@ -64,20 +76,24 @@ pub fn profile(plan: &Plan, artifact: &ArtifactName) -> AgentProfile {
     }
 }
 
-fn bench_commands(artifact: &ArtifactName) -> Value {
+fn bench_commands(artifact: &ArtifactName) -> Vec<String> {
     let executable = ".labflow/bin/labflow";
-    let mut commands = Map::new();
-    commands.insert("*".into(), Value::String("deny".into()));
-    for command in [
+    vec![
         format!("{executable} bench start {artifact}"),
         format!("{executable} bench finish {artifact}"),
         format!("{executable} challenge next {artifact}"),
         format!("{executable} challenge clarify {artifact} *"),
         format!("{executable} challenge archive {artifact}"),
-    ] {
-        commands.insert(command, Value::String("allow".into()));
+    ]
+}
+
+fn command_rules(commands: impl IntoIterator<Item = String>) -> Value {
+    let mut rules = Map::new();
+    rules.insert("*".into(), Value::String("deny".into()));
+    for command in commands {
+        rules.insert(command, Value::String("allow".into()));
     }
-    Value::Object(commands)
+    Value::Object(rules)
 }
 
 pub fn respondent_profile(artifact: &ArtifactName, bench: &Bench) -> AgentProfile {
@@ -126,6 +142,69 @@ pub fn profiles(plan: &Plan) -> BTreeMap<ArtifactName, AgentProfile> {
         .filter(|artifact| artifact.role().is_some())
         .map(|artifact| (artifact.clone(), profile(plan, artifact)))
         .collect()
+}
+
+pub fn environment_profiles(plan: &Plan) -> Vec<AgentProfile> {
+    let mut profiles: Vec<_> = profiles(plan).into_values().collect();
+    profiles.extend(plan.artifacts.iter().filter_map(|(name, artifact)| {
+        (artifact.kind == ArtifactKind::Bench)
+            .then(|| respondent_profile(name, artifact.bench.as_ref().expect("normalized bench")))
+    }));
+    profiles.sort_by(|left, right| left.id.cmp(&right.id));
+    profiles
+}
+
+pub fn materialize_environment(root: &Path, plan: &Plan) -> Result<String> {
+    let profiles = environment_profiles(plan);
+    let mut digest = Sha256::new();
+    for profile in &profiles {
+        digest.update(profile.id.as_bytes());
+        digest.update([0]);
+        digest.update(profile.content.as_bytes());
+        digest.update([0]);
+    }
+    let revision = format!("{:x}", digest.finalize());
+    let environment = root.join(OPENCODE_ENV_DIR).join(&revision);
+    let agents = environment.join("agents");
+    fs::create_dir_all(&agents)?;
+    for profile in &profiles {
+        materialize_one(&agents, profile)?;
+    }
+    write_revision(
+        &ArtifactName::parse(PLAN_ENV_ARTIFACT)?.path(root),
+        &revision,
+    )?;
+    Ok(revision)
+}
+
+pub fn verify_current_profile(root: &Path, profile: &AgentProfile) -> Result<()> {
+    let plan = read_revision(&ArtifactName::parse(PLAN_ENV_ARTIFACT)?.path(root))?;
+    let current = read_revision(&ArtifactName::parse(CURRENT_ENV_ARTIFACT)?.path(root))?;
+    if plan.is_none() || plan != current {
+        bail!("OpenCode environment is not current");
+    }
+    verify(
+        &root
+            .join(".labflow/opencode/agents")
+            .join(format!("{}.md", profile.id)),
+        profile,
+    )
+}
+
+pub fn read_revision(path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(value) => Ok(Some(value.trim().to_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_revision(path: &Path, revision: &str) -> Result<()> {
+    fs::create_dir_all(path.parent().expect("revision path has parent"))?;
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    fs::write(&temporary, format!("{revision}\n"))?;
+    fs::rename(&temporary, path)?;
+    Ok(())
 }
 
 fn add_path_patterns(patterns: &mut BTreeSet<String>, path: &AssetPath) {
@@ -178,12 +257,6 @@ fn materialize_one(directory: &Path, profile: &AgentProfile) -> Result<()> {
     result.with_context(|| format!("failed to materialize agent `{}`", profile.id))
 }
 
-pub fn materialize_profile(root: &Path, profile: &AgentProfile) -> Result<()> {
-    let directory = root.join(".labflow/opencode/agents");
-    fs::create_dir_all(&directory)?;
-    materialize_one(&directory, profile)
-}
-
 fn verify(path: &Path, profile: &AgentProfile) -> Result<()> {
     let existing = fs::read(path)?;
     if existing != profile.content.as_bytes() {
@@ -215,7 +288,8 @@ inputs = ["input.md", "references/"]
 assets = ["output.md", "generated/"]
 [artifacts."second.a1"]
 goal = "goal.md"
-permissions = ["bash"]
+permissions = []
+commands = ["./bin/check second"]
 "#,
         )
         .unwrap();
@@ -228,7 +302,11 @@ permissions = ["bash"]
         assert!(first.content.contains(
             r#""edit":{"*":"deny","generated":"allow","generated/*":"allow","output.md":"allow"}"#
         ));
-        assert!(second.content.contains(r#""bash":"allow""#));
+        assert!(
+            second
+                .content
+                .contains(r#""bash":{"*":"deny","./bin/check second":"allow"}"#)
+        );
         assert!(!second.content.contains(r#""webfetch":"allow""#));
         assert_ne!(first.id, second.id);
 
@@ -272,5 +350,24 @@ source = "questions.jsonl"
         ] {
             assert!(profile.content.contains(&format!(r#""{command}":"allow""#)));
         }
+
+        let root = tempdir().unwrap();
+        let revision = materialize_environment(root.path(), &plan).unwrap();
+        let agents = root
+            .path()
+            .join(OPENCODE_ENV_DIR)
+            .join(revision)
+            .join("agents");
+        let names: Vec<_> = fs::read_dir(agents)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.iter().any(|name| name.starts_with("evaluator.")));
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("score-evaluator."))
+        );
     }
 }

@@ -21,6 +21,7 @@ pub struct State {
     pub backend_ready: bool,
     pub supervisor_generation: Option<Option<Timestamp>>,
     pub plan_generation: Option<Option<Timestamp>>,
+    pub plan_reload_pending: bool,
     pub next_request_id: u64,
     pub host_tasks: HostTasks,
 }
@@ -44,6 +45,7 @@ impl State {
             backend_ready: false,
             supervisor_generation: None,
             plan_generation: None,
+            plan_reload_pending: false,
             next_request_id: 1,
             host_tasks: HostTasks::default(),
         }
@@ -372,6 +374,16 @@ impl Event {
         {
             effects.extend(schedule(state));
         }
+        if state.plan_reload_pending
+            && state.tasks.is_empty()
+            && state.observer_request.is_none()
+            && state.sessions.values().all(|session| !session.busy)
+            && !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ExitSupervisor))
+        {
+            effects.push(Effect::ReloadPlan);
+        }
         let host_tasks = compute_host_tasks(state);
         if host_tasks != state.host_tasks {
             state.host_tasks = host_tasks.clone();
@@ -573,13 +585,16 @@ fn reduce_artifact_observed(
     name: ArtifactName,
     modified: Option<Timestamp>,
 ) -> Vec<Effect> {
-    state.artifacts.insert(name.clone(), modified);
+    let previous = state.artifacts.insert(name.clone(), modified).flatten();
     let mut effects = vec![Effect::PersistArtifact {
         name: name.clone(),
         modified,
     }];
 
     match name.as_str() {
+        "system-active" if modified.is_some() && previous != modified => {
+            effects.push(Effect::ReloadPlan);
+        }
         "system-supervisor" => {
             if state.supervisor_generation.is_some()
                 && state.supervisor_generation != Some(modified)
@@ -593,7 +608,25 @@ fn reduce_artifact_observed(
                 && state.plan_generation.is_some()
                 && state.plan_generation != Some(modified)
             {
-                effects.push(Effect::ReloadPlan);
+                state.plan_reload_pending = true;
+                let cancellable: Vec<_> = state
+                    .tasks
+                    .iter()
+                    .filter(|(_, task)| {
+                        matches!(
+                            task.status,
+                            TaskStatus::WaitingSession | TaskStatus::Preparing
+                        )
+                    })
+                    .map(|(artifact, _)| artifact.clone())
+                    .collect();
+                for artifact in cancellable {
+                    state.tasks.remove(&artifact);
+                    effects.push(Effect::PersistTask {
+                        artifact,
+                        task: None,
+                    });
+                }
             }
             state.plan_generation = Some(modified);
         }
@@ -929,7 +962,7 @@ fn extend_session_release(effects: &mut Vec<Effect>, release: Option<(String, Se
 }
 
 fn schedule(state: &mut State) -> Vec<Effect> {
-    if !state.is_active() || !state.backend_ready {
+    if state.plan_reload_pending || !state.is_active() || !state.backend_ready {
         return Vec::new();
     }
     let candidates: Vec<_> = state
@@ -1112,6 +1145,12 @@ mod tests {
         assert!(
             effects
                 .iter()
+                .any(|effect| matches!(effect, Effect::ReloadPlan))
+        );
+        let effects = Event::SupervisorStarted.reduce(&mut state);
+        assert!(
+            effects
+                .iter()
                 .any(|effect| matches!(effect, Effect::CreateObserverSession { .. }))
         );
         let observer_request = state.observer_request.unwrap();
@@ -1138,8 +1177,10 @@ mod tests {
     #[test]
     fn unavailable_blocks_immediately() {
         let mut state = state();
+        state
+            .artifacts
+            .insert(ArtifactName::parse("system-active").unwrap(), Some(2));
         observed("query-request", 1).reduce(&mut state);
-        observed("system-active", 2).reduce(&mut state);
         let artifact = ArtifactName::parse("answer.researcher").unwrap();
         let request = state.tasks[&artifact].request_id;
         Event::SessionCreated {
@@ -1182,7 +1223,7 @@ mod tests {
         assert!(
             effects
                 .iter()
-                .any(|effect| matches!(effect, Effect::PrepareTask { .. }))
+                .any(|effect| matches!(effect, Effect::ReloadPlan))
         );
     }
 
@@ -1236,7 +1277,10 @@ requires = ["system-active"]
         let mut state = State::new(Arc::new(plan));
         state.backend_ready = true;
         state.virtual_artifacts.insert(name.clone(), 1);
-        observed("system-active", 2).reduce(&mut state);
+        state
+            .artifacts
+            .insert(ArtifactName::parse("system-active").unwrap(), Some(2));
+        schedule(&mut state);
         let request_id = state.tasks[&name].request_id;
         let effects = Event::SessionCreated {
             role: "r".into(),
@@ -1304,6 +1348,49 @@ requires = ["system-active"]
         let published = observed("system-plan", 11).reduce(&mut state);
         assert!(
             published
+                .iter()
+                .any(|effect| matches!(effect, Effect::ReloadPlan))
+        );
+    }
+
+    #[test]
+    fn system_plan_update_drains_running_tasks_before_reload() {
+        let mut state = state();
+        state.plan_generation = Some(Some(10));
+        let artifact = ArtifactName::parse("answer.researcher").unwrap();
+        state.sessions.insert(
+            "researcher".into(),
+            Session {
+                id: "ses_1".into(),
+                busy: true,
+            },
+        );
+        state.tasks.insert(
+            artifact.clone(),
+            Task {
+                status: TaskStatus::Running,
+                retries: 0,
+                failures: Vec::new(),
+                request_id: 7,
+                agent_id: "researcher.old".into(),
+                longest_reasoning_ms: None,
+            },
+        );
+
+        let effects = observed("system-plan", 11).reduce(&mut state);
+        assert!(state.plan_reload_pending);
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::ReloadPlan))
+        );
+
+        state.tasks.get_mut(&artifact).unwrap().status = TaskStatus::Publishing;
+        state.sessions.get_mut("researcher").unwrap().busy = false;
+        let effects = observed("answer.researcher", 12).reduce(&mut state);
+        assert!(!state.tasks.contains_key(&artifact));
+        assert!(
+            effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::ReloadPlan))
         );

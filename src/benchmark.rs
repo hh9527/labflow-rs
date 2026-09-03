@@ -193,6 +193,10 @@ struct TextPart<'a> {
 #[derive(Deserialize)]
 struct MessageResponse {
     #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    data: Value,
+    #[serde(default)]
     parts: Vec<MessagePart>,
 }
 
@@ -438,7 +442,7 @@ pub async fn run(root: PathBuf, name: String, command: Command) -> Result<()> {
         .join(".labflow/benchmarks")
         .join(format!("{}.sqlite", benchmark.name.as_str()));
     let profile = crate::agent::respondent_profile(&artifact_name, &benchmark);
-    crate::agent::materialize_profile(&root, &profile)?;
+    crate::agent::verify_current_profile(&root, &profile)?;
     if let Some(parent) = records.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -907,13 +911,22 @@ fn path_patterns(path: &AssetPath) -> Vec<String> {
 }
 
 fn response_text(response: MessageResponse) -> String {
-    response
+    if let Some(name) = response.name {
+        let message = response.data["message"].as_str().unwrap_or("unknown error");
+        return format!("[OpenCode {name}: {message}]");
+    }
+    let text = response
         .parts
         .into_iter()
         .filter(|part| part.kind == "text")
         .filter_map(|part| part.text)
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    if text.trim().is_empty() {
+        "[OpenCode returned no text]".into()
+    } else {
+        text
+    }
 }
 
 fn response_actions(
@@ -1035,7 +1048,9 @@ impl Drop for Lock {
 
 #[cfg(test)]
 mod tests {
-    use super::SourceQuestion;
+    use serde_json::json;
+
+    use super::{MessageResponse, SourceQuestion, response_text};
 
     #[test]
     fn hidden_knowledge_may_be_missing_or_null() {
@@ -1046,5 +1061,19 @@ mod tests {
             let question: SourceQuestion = serde_json::from_str(input).unwrap();
             assert_eq!(question.k, None);
         }
+    }
+
+    #[test]
+    fn respondent_errors_and_empty_replies_are_recorded() {
+        let error: MessageResponse = serde_json::from_value(
+            json!({"name": "UnknownError", "data": {"message": "Agent not found"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            response_text(error),
+            "[OpenCode UnknownError: Agent not found]"
+        );
+        let empty: MessageResponse = serde_json::from_value(json!({"parts": []})).unwrap();
+        assert_eq!(response_text(empty), "[OpenCode returned no text]");
     }
 }

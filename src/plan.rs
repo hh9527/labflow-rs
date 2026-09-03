@@ -44,6 +44,8 @@ pub struct Artifact {
     #[serde(default)]
     pub check: Vec<FilePath>,
     pub permissions: Option<Vec<String>>,
+    #[serde(default)]
+    pub commands: Vec<String>,
     pub bench: Option<Bench>,
 }
 
@@ -285,6 +287,16 @@ impl Plan {
                 }
             } else if artifact.permissions.is_some() {
                 bail!("host artifact `{name}` cannot declare `permissions`");
+            }
+            if name.role().is_none() && !artifact.commands.is_empty() {
+                bail!("host artifact `{name}` cannot declare `commands`");
+            }
+            if artifact
+                .commands
+                .iter()
+                .any(|command| command.trim().is_empty())
+            {
+                bail!("artifact `{name}` has an empty command");
             }
 
             match artifact.kind {
@@ -532,6 +544,35 @@ goal = "goal.md"
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("derived from artifact"));
+    }
+
+    #[test]
+    fn rejects_commands_on_host_artifacts_and_empty_commands() {
+        assert!(
+            Plan::parse(
+                r#"version = 1
+[artifacts.input]
+commands = ["./bin/check"]
+"#
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cannot declare `commands`")
+        );
+        assert!(
+            Plan::parse(
+                r#"version = 1
+[roles.worker]
+permissions = []
+[artifacts."output.worker"]
+goal = "goal.md"
+commands = ["  "]
+"#
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("empty command")
+        );
     }
 
     #[test]

@@ -204,7 +204,7 @@ fn configure(root: &Path, port: Option<u16>) -> Result<()> {
     fs::create_dir_all(root.join(ARTIFACTS_DIR))?;
     fs::create_dir_all(root.join(".labflow/benchmarks"))?;
     fs::create_dir_all(root.join(".labflow/locks"))?;
-    fs::create_dir_all(root.join(".labflow/opencode/agents"))?;
+    fs::create_dir_all(root.join(".labflow/oc-env"))?;
     fs::create_dir_all(root.join(".labflow/bin"))?;
     let plan_path = root.join(PLAN_FILE);
     if !plan_path.exists() {
@@ -250,18 +250,13 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ARTIFACTS="$ROOT/.labflow/artifacts"
 CONFIG="$ROOT/.labflow/config"
 POLL_INTERVAL="${LABFLOW_POLL_INTERVAL:-0.1}"
-LABFLOW="${LABFLOW:-labflow}"
 OPENCODE="${OPENCODE:-opencode}"
+LABFLOW_LINK="$ROOT/.labflow/bin/labflow"
 
-LABFLOW_PATH="$(command -v -- "$LABFLOW")" || {
-    echo "cannot resolve labflow executable: $LABFLOW" >&2
+if [[ ! -x "$LABFLOW_LINK" ]]; then
+    echo "labflow executable is missing: $LABFLOW_LINK; run labflow config" >&2
     exit 1
-}
-LABFLOW_PATH="$(realpath -- "$LABFLOW_PATH")" || {
-    echo "cannot resolve absolute labflow path: $LABFLOW_PATH" >&2
-    exit 1
-}
-ln -sfn -- "$LABFLOW_PATH" "$ROOT/.labflow/bin/labflow"
+fi
 
 mkdir -p -- "$ARTIFACTS"
 cd -- "$ROOT"
@@ -302,7 +297,7 @@ supervisor_loop() {
             previous="$generation"
             failures=0
         fi
-        "$LABFLOW" --root "$ROOT" supervisor &
+        "$LABFLOW_LINK" --root "$ROOT" supervisor &
         pid=$!
         wait "$pid"
         status=$?
@@ -321,10 +316,15 @@ supervisor_loop() {
 
 backend_loop() {
     local control="$ARTIFACTS/system-backend"
-    local generation="" previous="" current="" pid="" failures=0 status=0
-    trap '[[ -z "$pid" ]] || kill -TERM "$pid" 2>/dev/null || true; exit 0' TERM
+    local plan_env="$ARTIFACTS/_plan-env"
+    local current_env="$ARTIFACTS/_current-env"
+    local config_dir="$ROOT/.labflow/opencode"
+    local generation="" previous="" current="" revision="" source="" staging=""
+    local pid="" failures=0 status=0
+    trap 'rm -f -- "$current_env"; [[ -z "$pid" ]] || kill -TERM "$pid" 2>/dev/null || true; exit 0' TERM
     while :; do
-        if [[ ! -e "$control" ]]; then
+        if [[ ! -e "$control" ]] || [[ ! -s "$plan_env" ]]; then
+            rm -f -- "$current_env"
             previous=""
             failures=0
             sleep "$POLL_INTERVAL"
@@ -335,7 +335,26 @@ backend_loop() {
             previous="$generation"
             failures=0
         fi
-        OPENCODE_CONFIG_DIR="$ROOT/.labflow/opencode" \
+        IFS= read -r revision < "$plan_env" || revision=""
+        if [[ ! "$revision" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "invalid plan environment revision: $revision" >&2
+            sleep "$POLL_INTERVAL"
+            continue
+        fi
+        source="$ROOT/.labflow/oc-env/$revision"
+        if [[ ! -d "$source/agents" ]]; then
+            echo "plan environment does not exist: $source" >&2
+            sleep "$POLL_INTERVAL"
+            continue
+        fi
+        staging="$ROOT/.labflow/.opencode.$$.tmp"
+        rm -rf -- "$staging"
+        cp -a -- "$source" "$staging"
+        rm -rf -- "$config_dir"
+        mv -- "$staging" "$config_dir"
+        printf '%s\n' "$revision" > "$current_env.tmp"
+        mv -- "$current_env.tmp" "$current_env"
+        OPENCODE_CONFIG_DIR="$config_dir" \
         OPENCODE_DISABLE_PROJECT_CONFIG=1 \
         "$OPENCODE" serve --hostname 127.0.0.1 --port "$PORT" &
         pid=$!
@@ -354,6 +373,7 @@ backend_loop() {
         wait "$pid"
         status=$?
         pid=""
+        rm -f -- "$current_env"
         if [[ -e "$control" ]] && [[ "$(mtime "$control")" == "$generation" ]]; then
             failures=$((failures + 1))
             if (( failures >= 3 )); then

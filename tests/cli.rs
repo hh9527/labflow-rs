@@ -10,6 +10,7 @@ use assert_cmd::cargo::cargo_bin;
 use labflow::artifact::ArtifactName;
 use labflow::config::Config;
 use labflow::db::{Databases, HostTasks, read_host_tasks};
+use labflow::plan::Plan;
 use rusqlite::Connection;
 
 fn labflow() -> Command {
@@ -36,6 +37,12 @@ fn host_can_configure_publish_and_unpublish() {
     assert_eq!(Config::load(directory.path()).unwrap().port, 4096);
     let run = directory.path().join(".labflow/bin/run");
     assert!(run.is_file());
+    assert!(
+        fs::read_to_string(&run)
+            .unwrap()
+            .contains(r#""$LABFLOW_LINK" --root "$ROOT" supervisor"#)
+    );
+    assert!(!fs::read_to_string(&run).unwrap().contains("LABFLOW="));
     #[cfg(unix)]
     assert_eq!(
         fs::read_link(directory.path().join(".labflow/bin/labflow")).unwrap(),
@@ -269,6 +276,13 @@ check = ["answer.md"]
         ])
         .status()
         .unwrap();
+    let plan_env = directory.path().join(".labflow/artifacts/_plan-env");
+    wait_until(Duration::from_secs(10), || plan_env.is_file());
+    fs::copy(
+        &plan_env,
+        directory.path().join(".labflow/artifacts/_current-env"),
+    )
+    .unwrap();
     wait_until(Duration::from_secs(15), || {
         directory.path().join("answer.md").is_file()
             && directory
@@ -276,10 +290,17 @@ check = ["answer.md"]
                 .join(".labflow/artifacts/answer.researcher")
                 .is_file()
     });
-    let agents = fs::read_dir(directory.path().join(".labflow/opencode/agents"))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let revision = fs::read_to_string(&plan_env).unwrap();
+    let agents = fs::read_dir(
+        directory
+            .path()
+            .join(".labflow/oc-env")
+            .join(revision.trim())
+            .join("agents"),
+    )
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
     assert_eq!(agents.len(), 1);
     assert!(!directory.path().join(".opencode").exists());
     let agent_name = agents[0].file_name().into_string().unwrap();
@@ -463,6 +484,24 @@ commands = ["just verify"]
     fs::write(
         directory.path().join("questions.jsonl"),
         "{\"id\":\"q1\",\"Q\":\"solve it\",\"K\":\"hidden hint\",\"R\":\"reference\",\"tags\":[\"logic\",\"hard\"]}\n",
+    )
+    .unwrap();
+    let plan = Plan::load(directory.path()).unwrap();
+    let revision = labflow::agent::materialize_environment(directory.path(), &plan).unwrap();
+    let source = directory
+        .path()
+        .join(labflow::agent::OPENCODE_ENV_DIR)
+        .join(revision)
+        .join("agents");
+    let current = directory.path().join(".labflow/opencode/agents");
+    fs::create_dir_all(&current).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(entry.path(), current.join(entry.file_name())).unwrap();
+    }
+    fs::copy(
+        directory.path().join(".labflow/artifacts/_plan-env"),
+        directory.path().join(".labflow/artifacts/_current-env"),
     )
     .unwrap();
     let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_opencode.py");
@@ -842,6 +881,7 @@ fn run_script_tracks_backend_restart_and_shutdown() {
             "publish",
             "system-supervisor",
             "system-backend",
+            "system-active",
         ])
         .status()
         .unwrap();
@@ -863,7 +903,6 @@ fn run_script_tracks_backend_restart_and_shutdown() {
         fs::set_permissions(&opencode, permissions).unwrap();
     }
     let mut runner = Command::new(directory.path().join(".labflow/bin/run"))
-        .env("LABFLOW", cargo_bin("labflow"))
         .env("OPENCODE", &opencode)
         .env("LABFLOW_POLL_INTERVAL", "0.02")
         .stdout(Stdio::null())
@@ -891,12 +930,18 @@ fn run_script_tracks_backend_restart_and_shutdown() {
         .unwrap()
         .lines()
         .count();
+    let first_revision =
+        fs::read_to_string(directory.path().join(".labflow/artifacts/_current-env")).unwrap();
+    let updated_plan = fs::read_to_string(directory.path().join("lab-plan.toml"))
+        .unwrap()
+        .replace("permissions = []", "permissions = [\"webfetch\"]");
+    fs::write(directory.path().join("lab-plan.toml"), updated_plan).unwrap();
     labflow()
         .args([
             "--root",
             directory.path().to_str().unwrap(),
             "publish",
-            "system-backend",
+            "system-plan",
         ])
         .status()
         .unwrap();
@@ -904,6 +949,12 @@ fn run_script_tracks_backend_restart_and_shutdown() {
         fs::read_to_string(directory.path().join("backend-starts"))
             .is_ok_and(|content| content.lines().count() > first)
     });
+    let plan_revision =
+        fs::read_to_string(directory.path().join(".labflow/artifacts/_plan-env")).unwrap();
+    let current_revision =
+        fs::read_to_string(directory.path().join(".labflow/artifacts/_current-env")).unwrap();
+    assert_ne!(first_revision, plan_revision);
+    assert_eq!(plan_revision, current_revision);
     Command::new("kill")
         .args(["-TERM", &runner_pid.to_string()])
         .status()
@@ -937,6 +988,9 @@ fn run_script_disables_crashing_supervisor_generation() {
         ])
         .status()
         .unwrap();
+    fs::remove_file(directory.path().join(".labflow/bin/labflow")).unwrap();
+    std::os::unix::fs::symlink("/bin/false", directory.path().join(".labflow/bin/labflow"))
+        .unwrap();
     labflow()
         .args([
             "--root",
@@ -947,7 +1001,6 @@ fn run_script_disables_crashing_supervisor_generation() {
         .status()
         .unwrap();
     let mut runner = Command::new(directory.path().join(".labflow/bin/run"))
-        .env("LABFLOW", "/bin/false")
         .env("LABFLOW_POLL_INTERVAL", "0.01")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
