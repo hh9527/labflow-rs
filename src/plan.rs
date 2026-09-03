@@ -59,12 +59,34 @@ pub enum ArtifactKind {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bench {
+    pub name: BenchName,
     pub source: FilePath,
     pub qlist: FilePath,
     #[serde(default, rename = "public-knowledge")]
     pub public_knowledge: Vec<AssetPath>,
     #[serde(default)]
     pub permissions: BenchPermissions,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct BenchName(String);
+
+impl BenchName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for BenchName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        validate_part(&value).map_err(serde::de::Error::custom)?;
+        Ok(Self(value))
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -238,6 +260,7 @@ impl Plan {
                 .with_context(|| format!("invalid permissions for role `{role}`"))?;
         }
 
+        let mut bench_names = BTreeMap::new();
         for (name, artifact) in &mut self.artifacts {
             if name.is_supervisor() {
                 bail!("supervisor artifact `{name}` is built in and cannot be declared");
@@ -284,11 +307,8 @@ impl Plan {
                     if artifact.goal.is_some() {
                         bail!("bench artifact `{name}` cannot declare `goal`");
                     }
-                    if artifact.assets.len() != 1 || artifact.assets[0].is_directory() {
-                        bail!("bench artifact `{name}` must declare exactly one file asset");
-                    }
-                    if !artifact.check.is_empty() {
-                        bail!("bench artifact `{name}` cannot declare `check`");
+                    if !artifact.assets.is_empty() || !artifact.check.is_empty() {
+                        bail!("bench artifact `{name}` cannot declare assets or check");
                     }
                     let bench = artifact
                         .bench
@@ -302,7 +322,12 @@ impl Plan {
                     {
                         bail!("bench artifact `{name}` has an empty command");
                     }
-                    artifact.check = vec![FilePath(artifact.assets[0].clone())];
+                    if let Some(previous) = bench_names.insert(bench.name.clone(), name.clone()) {
+                        bail!(
+                            "bench artifacts `{previous}` and `{name}` use duplicate bench name `{}`",
+                            bench.name.as_str()
+                        );
+                    }
                 }
             }
         }
@@ -547,15 +572,15 @@ goal = "learn.md"
 inputs = ["knowledge/"]
 [artifacts."bench-solver.r"]
 kind = "bench"
-assets = ["bench.sqlite"]
 [artifacts."bench-solver.r".bench]
+name = "solver"
 source = "questions.jsonl"
 qlist = "questions.ids"
 "#,
         )
         .unwrap();
         let bench = &plan.artifacts[&ArtifactName::parse("bench-solver.r").unwrap()];
-        assert_eq!(bench.check[0].as_str(), "bench.sqlite");
+        assert!(bench.check.is_empty());
         assert_eq!(
             plan.artifact_inputs(&ArtifactName::parse("learn-domain.r").unwrap()),
             vec![
@@ -569,9 +594,27 @@ qlist = "questions.ids"
         )
         .is_err());
         assert!(Plan::parse(
-            "version = 1\n[roles.r]\n[artifacts.'bad.r']\nkind = 'bench'\nassets = ['a.db', 'b.db']\n[artifacts.'bad.r'.bench]\nsource = 'q.jsonl'\nqlist = 'q.ids'\n"
+            "version = 1\n[roles.r]\n[artifacts.'bad.r']\nkind = 'bench'\nassets = ['a.db']\n[artifacts.'bad.r'.bench]\nname = 'bad'\nsource = 'q.jsonl'\nqlist = 'q.ids'\n"
         )
         .is_err());
+        let duplicate = r#"version = 1
+[roles.r]
+[artifacts."bench-one.r"]
+kind = "bench"
+[artifacts."bench-one.r".bench]
+name = "shared"
+source = "q.jsonl"
+qlist = "q.ids"
+[artifacts."bench-two.r"]
+kind = "bench"
+[artifacts."bench-two.r".bench]
+name = "shared"
+source = "q.jsonl"
+qlist = "q.ids"
+"#;
+        assert!(
+            format!("{:#}", Plan::parse(duplicate).unwrap_err()).contains("duplicate bench name")
+        );
     }
 
     #[test]

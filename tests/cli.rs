@@ -396,8 +396,8 @@ fn benchmark_cli_runs_isolated_respondent_round() {
 [roles.challenger]
 [artifacts."bench-solver.challenger"]
 kind = "bench"
-assets = ["bench/results.sqlite"]
 [artifacts."bench-solver.challenger".bench]
+name = "solver"
 public-knowledge = ["public/"]
 source = "questions.jsonl"
 qlist = "questions.ids"
@@ -493,7 +493,8 @@ commands = ["just verify"]
             .is_some_and(|agent| agent.starts_with("bench-solver-challenger."))
     );
     assert!(directory.path().join("benchmark-deleted").is_file());
-    let records = Connection::open(directory.path().join("bench/results.sqlite")).unwrap();
+    let records =
+        Connection::open(directory.path().join(".labflow/benchmarks/solver.sqlite")).unwrap();
     assert_eq!(
         records
             .query_row("SELECT status FROM bench_round", [], |row| row

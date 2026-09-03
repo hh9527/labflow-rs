@@ -44,9 +44,9 @@ assets = ["outputs/review.md"]
 [artifacts."bench-solver.a2"]
 kind = "bench"
 requires = ["system-active", "answer.a1"]
-assets = ["benchmarks/solver.sqlite"]
 
 [artifacts."bench-solver.a2".bench]
+name = "solver"
 source = "benchmark/questions.jsonl"
 qlist = "benchmark/round-1.ids"
 public-knowledge = ["benchmark/public/"]
@@ -117,8 +117,9 @@ Bench 将 RFC 0002 的顶层 `[benchmark.*]` 收入 artifact：
 
 - artifact 名称后缀表示挑战者 C 的 DAG role；
 - `goal` 被禁止，C 使用 Labflow 内建的挑战者任务提示；
-- `assets` 必须且只能包含一个文件，即追加式 records SQLite 数据库；
-- `check` 不可配置，由唯一的 records 文件自动派生；
+- `bench.name` 必须符合 artifact part 命名规则，并且在整个计划中唯一；
+- records 固定派生为 `.labflow/benchmarks/<bench.name>.sqlite`；
+- `assets` 和 `check` 均不可配置，records 是 Labflow 管理的内部数据库；
 - `bench.source` 和 `bench.qlist` 必须是文件；
 - `bench.public-knowledge` 可以包含文件或以 `/` 结尾的目录；
 - `bench.permissions` 包含 `read`、`write` 和 `commands`。
@@ -132,6 +133,9 @@ labflow challenge clarify bench-solver.a2 '<text>'
 labflow challenge archive bench-solver.a2
 labflow bench finish bench-solver.a2
 ```
+
+`.labflow/artifacts/bench-solver.a2` 仍是表示该次构建完成的名义制品文件，
+与追加保存所有历史轮次的 `.labflow/benchmarks/solver.sqlite` 相互独立。
 
 题目、轮次、澄清和 records schema 继续遵循 RFC 0002。`source`、`qlist` 和隐藏
 知识只对 C 可见；R 只能通过对话取得 Q 和 C 基于公开背景及 K 编写的澄清。
@@ -157,7 +161,7 @@ R 不加入 `[roles]`、DAG State、states.sqlite 或 timeline.sqlite。
 ## 校验与发布
 
 `Plan` 继续直接通过 serde 和经过校验的 newtype 反序列化，再调用
-`normalize(self) -> Result<Self>` 完成跨字段约束、输入派生和 Bench check 派生。
+`normalize(self) -> Result<Self>` 完成跨字段约束、输入派生和 Bench 名称唯一性校验。
 未知字段全部拒绝，不为旧的 `[backend]`、`roles.kind`、`[benchmark]` 或
 `_ready.<role>` 提供兼容别名。
 

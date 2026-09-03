@@ -424,7 +424,9 @@ pub async fn run(root: PathBuf, name: String, command: Command) -> Result<()> {
         bail!("artifact `{name}` is not a bench artifact");
     }
     let benchmark = artifact.bench.clone().expect("normalized bench artifact");
-    let records = artifact.assets[0].resolve(&root);
+    let records = root
+        .join(".labflow/benchmarks")
+        .join(format!("{}.sqlite", benchmark.name.as_str()));
     let profile = crate::agent::respondent_profile(&artifact_name, &benchmark);
     crate::agent::materialize_profile(&root, &profile)?;
     if let Some(parent) = records.parent() {

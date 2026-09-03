@@ -70,9 +70,9 @@ inputs = ["knowledge/domain/"]
 [artifacts."bench-answer.evaluator"]
 kind = "bench"
 requires = ["answer.researcher"]
-assets = ["benchmarks/answer.sqlite"]
 
 [artifacts."bench-answer.evaluator".bench]
+name = "answer"
 source = "benchmark/questions.jsonl"
 qlist = "benchmark/current.ids"
 public-knowledge = ["benchmark/public/"]
