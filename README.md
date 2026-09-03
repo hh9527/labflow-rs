@@ -56,7 +56,7 @@ permissions = ["webfetch"]
 assets = ["goal.md"]
 
 [artifacts."answer.researcher"]
-depends-on = ["system-active", "_ready.researcher", "query-request"]
+requires = ["system-active", "_ready.researcher", "query-request"]
 goal = "goal.md"
 assets = ["answer.md"]
 check = ["answer.md"]

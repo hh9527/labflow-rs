@@ -1033,13 +1033,13 @@ fn schedule(state: &mut State) -> Vec<Effect> {
         .filter(|(name, _)| !state.tasks.contains_key(*name))
         .filter(|(name, artifact)| {
             let output = state.timestamp(name);
-            let required_exist = artifact.dependencies.iter().all(|dependency| {
+            let required_exist = artifact.requires.iter().all(|dependency| {
                 dependency.optional
                     || dependency.name.as_str().starts_with("_ready.")
                     || state.timestamp(&dependency.name).is_some()
             });
             let stale = output.is_none()
-                || artifact.dependencies.iter().any(|dependency| {
+                || artifact.requires.iter().any(|dependency| {
                     state
                         .timestamp(&dependency.name)
                         .is_some_and(|input| output.is_none_or(|output| input > output))
@@ -1121,7 +1121,7 @@ fn compute_host_tasks(state: &State) -> HostTasks {
         }
         let output = state.timestamp(name);
         let stale = output.is_none()
-            || artifact.dependencies.iter().any(|dependency| {
+            || artifact.requires.iter().any(|dependency| {
                 state
                     .timestamp(&dependency.name)
                     .is_some_and(|input| output.is_none_or(|output| input > output))
@@ -1129,7 +1129,7 @@ fn compute_host_tasks(state: &State) -> HostTasks {
         if !stale {
             continue;
         }
-        for dependency in &artifact.dependencies {
+        for dependency in &artifact.requires {
             let active_decision = dependency.name.as_str() == "system-active" && !state.is_active();
             if dependency.name.role().is_some()
                 || dependency.name.is_supervisor()
@@ -1293,7 +1293,7 @@ kind = "lab-worker"
 [artifacts.feedback]
 [artifacts."answer.r"]
 goal = "goal.md"
-depends-on = ["request", "feedback?"]
+requires = ["request", "feedback?"]
 "#,
         )
         .unwrap();

@@ -60,8 +60,8 @@ pub enum RoleKind {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Artifact {
-    #[serde(default, rename = "depends-on")]
-    pub dependencies: Vec<Dependency>,
+    #[serde(default, rename = "requires")]
+    pub requires: Vec<Dependency>,
     #[serde(default)]
     pub goal: Option<FilePath>,
     #[serde(default)]
@@ -80,8 +80,8 @@ pub struct Benchmark {
     #[serde(skip)]
     pub respondent: String,
     pub records: FilePath,
-    #[serde(default, rename = "depends-on")]
-    pub dependencies: Vec<Dependency>,
+    #[serde(default, rename = "requires")]
+    pub requires: Vec<Dependency>,
     #[serde(default, rename = "public-knowledge")]
     pub public_knowledge: Vec<AssetPath>,
     pub challenge: Challenge,
@@ -363,7 +363,7 @@ impl Plan {
             self.artifacts.insert(
                 artifact_name.clone(),
                 Artifact {
-                    dependencies: benchmark.dependencies.clone(),
+                    requires: benchmark.requires.clone(),
                     goal: None,
                     assets: vec![benchmark.records.0.clone()],
                     inputs: Some(inputs.into_iter().collect()),
@@ -385,7 +385,7 @@ impl Plan {
             return inputs.clone();
         }
         artifact
-            .dependencies
+            .requires
             .iter()
             .filter_map(|dependency| self.artifacts.get(&dependency.name))
             .flat_map(|dependency| dependency.assets.iter().cloned())
@@ -429,7 +429,7 @@ fn validate_dependencies(
 ) -> Result<()> {
     for (name, artifact) in artifacts {
         let mut seen = BTreeSet::new();
-        for dependency in &artifact.dependencies {
+        for dependency in &artifact.requires {
             if !seen.insert(&dependency.name) {
                 bail!(
                     "artifact `{name}` has duplicate dependency `{}`",
@@ -472,7 +472,7 @@ fn validate_acyclic(artifacts: &BTreeMap<ArtifactName, Artifact>) -> Result<()> 
         if !visiting.insert(name) {
             bail!("artifact dependency cycle contains `{name}`");
         }
-        for dependency in &artifacts[name].dependencies {
+        for dependency in &artifacts[name].requires {
             if artifacts.contains_key(&dependency.name) {
                 visit(&dependency.name, artifacts, visiting, visited)?;
             }
@@ -504,7 +504,7 @@ permissions = []
 assets = ["goal.md"]
 
 [artifacts."answer.researcher"]
-depends-on = ["system-active", "_ready.researcher", "query-request"]
+requires = ["system-active", "_ready.researcher", "query-request"]
 goal = "goal.md"
 assets = ["answer.md"]
 check = ["answer.md"]
@@ -523,7 +523,7 @@ mod tests {
         );
         let artifact = &plan.artifacts[&ArtifactName::parse("answer.researcher").unwrap()];
         assert_eq!(artifact.inputs, None);
-        assert_eq!(artifact.dependencies.len(), 3);
+        assert_eq!(artifact.requires.len(), 3);
         assert_eq!(
             plan.artifact_inputs(&ArtifactName::parse("answer.researcher").unwrap()),
             vec![AssetPath::parse("goal.md", true).unwrap()]
@@ -538,10 +538,10 @@ version = 1
 kind = "lab-worker"
 [artifacts."a.r"]
 goal = "goal.md"
-depends-on = ["b.r"]
+requires = ["b.r"]
 [artifacts."b.r"]
 goal = "goal.md"
-depends-on = ["a.r"]
+requires = ["a.r"]
 "#;
         assert!(
             Plan::parse(cycle)
@@ -582,9 +582,29 @@ goal = "goal.md"
         );
 
         let decoded = toml::from_str::<Plan>(
-            "version = 1\n[roles.r]\nkind = 'lab-worker'\n[artifacts.'a.r']\ngoal = 'goal.md'\ndepends-on = ['missing?']\n",
+            "version = 1\n[roles.r]\nkind = 'lab-worker'\n[artifacts.'a.r']\ngoal = 'goal.md'\nrequires = ['missing?']\n",
         )
         .unwrap();
         assert!(decoded.normalize().is_err());
+    }
+
+    #[test]
+    fn requires_replaces_depends_on_without_compatibility_alias() {
+        let plan = Plan::parse(
+            "version = 1\n[artifacts.source]\n[artifacts.result]\nrequires = ['source']\n",
+        )
+        .unwrap();
+        assert_eq!(
+            plan.artifacts[&ArtifactName::parse("result").unwrap()]
+                .requires
+                .len(),
+            1
+        );
+
+        let error = Plan::parse(
+            "version = 1\n[artifacts.source]\n[artifacts.result]\ndepends-on = ['source']\n",
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unknown field `depends-on`"));
     }
 }

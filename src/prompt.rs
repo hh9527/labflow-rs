@@ -51,7 +51,7 @@ pub fn build_task_prompt_with_inputs(
     );
 
     for dependency in artifact
-        .dependencies
+        .requires
         .iter()
         .filter(|dependency| !dependency.name.is_supervisor())
     {
@@ -110,7 +110,7 @@ fn effective_inputs(root: &Path, plan: &Plan, artifact: &Artifact) -> Result<Vec
         return Ok(inputs.clone());
     }
     let mut result = BTreeSet::new();
-    for dependency in &artifact.dependencies {
+    for dependency in &artifact.requires {
         if dependency.name.is_supervisor() {
             continue;
         }
@@ -210,7 +210,7 @@ assets = ["materials/"]
 [artifacts.feedback]
 assets = ["optional.txt"]
 [artifacts."result.r"]
-depends-on = ["source", "feedback?"]
+requires = ["source", "feedback?"]
 goal = "goal.md"
 "#,
         )

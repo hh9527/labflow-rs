@@ -14,7 +14,7 @@ OpenCode agent R 在每轮全新的顶层会话中作答。Labflow 负责题目�
 ```toml
 [benchmark."a.b1"]
 records = "benchmarks/a-b1.sqlite"
-depends-on = ["system-active", "_ready.b1"]
+requires = ["system-active", "_ready.b1"]
 public-knowledge = ["knowledge/public/"]
 
 challenge.source = "datasets/questions.jsonl"
@@ -38,7 +38,7 @@ worker artifact `bench-a.b1`，其唯一输出和检查项为 `records`。
 - `challenge.source` 和 `challenge.questions` 必须是文件。
 
 自动生成的 `bench-<respondent>.<challenger-role>` 不能与显式 artifact 重名。
-`depends-on` 使用与普通 artifact 相同的依赖语义。
+`requires` 使用与普通 artifact 相同的依赖语义。
 
 ## 题目输入
 

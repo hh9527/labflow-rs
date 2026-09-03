@@ -128,7 +128,7 @@ permissions = []
 [artifacts.query-request]
 assets = ["goal.md"]
 [artifacts."answer.researcher"]
-depends-on = ["query-request"]
+requires = ["query-request"]
 goal = "goal.md"
 assets = ["answer.md"]
 check = ["answer.md"]
