@@ -46,6 +46,7 @@ enum Command {
         #[arg(long, value_name = "SECONDS")]
         poll: Option<u64>,
     },
+    Query(QueryArgs),
     QueryBench(QueryBenchArgs),
     Bench {
         #[command(subcommand)]
@@ -58,13 +59,19 @@ enum Command {
 }
 
 #[derive(Debug, Args)]
+struct QueryBenchArgs {
+    name: BenchName,
+    #[command(flatten)]
+    query: QueryArgs,
+}
+
+#[derive(Debug, Args)]
 #[command(group(
     ArgGroup::new("source")
         .required(true)
         .args(["execute", "file"])
 ))]
-struct QueryBenchArgs {
-    name: BenchName,
+struct QueryArgs {
     #[arg(short = 'e', long = "execute")]
     execute: Option<String>,
     #[arg(short = 'f', long = "file", value_name = "SQL_FILE")]
@@ -117,27 +124,14 @@ pub async fn run() -> Result<()> {
             crate::runtime::run(root, generation).await
         }
         Command::HostTasks { poll } => host_tasks(&root, poll).await,
+        Command::Query(arguments) => {
+            let sql = read_query(&root, arguments)?;
+            let output = crate::query::query_system(&root, &sql)?;
+            println!("{}", serde_json::to_string(&output)?);
+            Ok(())
+        }
         Command::QueryBench(arguments) => {
-            let sql = match (arguments.execute, arguments.file) {
-                (Some(sql), None) => sql,
-                (None, Some(path)) if path == Path::new("-") => {
-                    let mut sql = String::new();
-                    std::io::stdin()
-                        .read_to_string(&mut sql)
-                        .context("failed to read SQL from stdin")?;
-                    sql
-                }
-                (None, Some(path)) => {
-                    let path = if path.is_absolute() {
-                        path
-                    } else {
-                        root.join(path)
-                    };
-                    fs::read_to_string(&path)
-                        .with_context(|| format!("failed to read `{}`", path.display()))?
-                }
-                _ => unreachable!("clap requires exactly one query source"),
-            };
+            let sql = read_query(&root, arguments.query)?;
             let output = benchmark::query(&root, &arguments.name, &sql)?;
             println!("{}", serde_json::to_string(&output)?);
             Ok(())
@@ -161,6 +155,29 @@ pub async fn run() -> Result<()> {
                 benchmark::run(root, name, benchmark::Command::Archive).await
             }
         },
+    }
+}
+
+fn read_query(root: &Path, arguments: QueryArgs) -> Result<String> {
+    match (arguments.execute, arguments.file) {
+        (Some(sql), None) => Ok(sql),
+        (None, Some(path)) if path == Path::new("-") => {
+            let mut sql = String::new();
+            std::io::stdin()
+                .read_to_string(&mut sql)
+                .context("failed to read SQL from stdin")?;
+            Ok(sql)
+        }
+        (None, Some(path)) => {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            };
+            fs::read_to_string(&path)
+                .with_context(|| format!("failed to read `{}`", path.display()))
+        }
+        _ => unreachable!("clap requires exactly one query source"),
     }
 }
 
@@ -204,7 +221,25 @@ fn configure(root: &Path, port: Option<u16>) -> Result<()> {
     let script = root.join(".labflow/bin/run");
     fs::write(&script, RUN_SCRIPT)?;
     set_executable(&script)?;
+    set_labflow_link(&root.join(".labflow/bin/labflow"))?;
     println!("configured {}", root.display());
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_labflow_link(path: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let executable = fs::canonicalize(std::env::current_exe()?)?;
+    if fs::symlink_metadata(path).is_ok() {
+        fs::remove_file(path)?;
+    }
+    symlink(executable, path)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_labflow_link(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -217,6 +252,16 @@ CONFIG="$ROOT/.labflow/config"
 POLL_INTERVAL="${LABFLOW_POLL_INTERVAL:-0.1}"
 LABFLOW="${LABFLOW:-labflow}"
 OPENCODE="${OPENCODE:-opencode}"
+
+LABFLOW_PATH="$(command -v -- "$LABFLOW")" || {
+    echo "cannot resolve labflow executable: $LABFLOW" >&2
+    exit 1
+}
+LABFLOW_PATH="$(realpath -- "$LABFLOW_PATH")" || {
+    echo "cannot resolve absolute labflow path: $LABFLOW_PATH" >&2
+    exit 1
+}
+ln -sfn -- "$LABFLOW_PATH" "$ROOT/.labflow/bin/labflow"
 
 mkdir -p -- "$ARTIFACTS"
 cd -- "$ROOT"

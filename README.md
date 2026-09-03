@@ -21,6 +21,8 @@ labflow plan check
 labflow publish system-supervisor system-backend system-active query-request
 labflow publish '!query-request'
 labflow host-tasks --poll 60
+labflow query -e 'SELECT * FROM timeline.artifact_turn'
+labflow query -f analysis.sql
 labflow query-bench solver -e 'SELECT * FROM bench_round'
 labflow query-bench solver -f analysis.sql
 printf 'SELECT * FROM question' | labflow query-bench solver -f -
@@ -98,6 +100,10 @@ commands = ["just verify"]
 标准输入读取到 EOF。数据库以
 只读模式打开，结果输出为 `{"columns":[...],"rows":[...]}` JSON；BLOB 表示为
 `{"base64":"..."}`。
+
+`query` 使用相同的 `-e`、`-f` 和 JSON 输出约定，将内部数据库以只读方式同时
+挂载为 `timeline` 与 `states` schema。因此既可查询
+`timeline.artifact_turn` 或 `states.artifacts`，也可在一条 SQL 中跨库 JOIN。
 
 artifact 的角色始终是后缀，例如 `answer.researcher`。Host 可以通过 publish
 普通名称或 `!名称` 操作非 `_` 的实体 artifact；Learn artifact 和 `_blocked`

@@ -5,10 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine;
 use fs2::FileExt;
 use reqwest::Client;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params, types::ValueRef};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -16,48 +15,13 @@ use sha2::{Digest, Sha256};
 use crate::artifact::ArtifactName;
 use crate::config::Config;
 use crate::plan::{ArtifactKind, AssetPath, Bench, BenchName, PLAN_FILE, Plan};
-
-#[derive(Debug, Serialize)]
-pub struct QueryOutput {
-    columns: Vec<String>,
-    rows: Vec<Vec<Value>>,
-}
+use crate::query::{QueryOutput, query_database};
 
 pub fn query(root: &Path, name: &BenchName, sql: &str) -> Result<QueryOutput> {
     let path = root
         .join(".labflow/benchmarks")
         .join(format!("{}.sqlite", name.as_str()));
-    if !path.is_file() {
-        bail!("benchmark database `{}` does not exist", path.display());
-    }
-    let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("failed to open `{}` read-only", path.display()))?;
-    connection.pragma_update(None, "query_only", true)?;
-    let mut statement = connection.prepare(sql).context("invalid benchmark query")?;
-    let columns = statement
-        .column_names()
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect();
-    let column_count = statement.column_count();
-    let rows = statement
-        .query_map([], |row| {
-            (0..column_count)
-                .map(|index| match row.get_ref(index)? {
-                    ValueRef::Null => Ok(Value::Null),
-                    ValueRef::Integer(value) => Ok(Value::from(value)),
-                    ValueRef::Real(value) => Ok(Value::from(value)),
-                    ValueRef::Text(value) => {
-                        Ok(Value::String(String::from_utf8_lossy(value).into_owned()))
-                    }
-                    ValueRef::Blob(value) => Ok(serde_json::json!({
-                        "base64": base64::engine::general_purpose::STANDARD.encode(value)
-                    })),
-                })
-                .collect::<rusqlite::Result<Vec<_>>>()
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(QueryOutput { columns, rows })
+    query_database(&path, "benchmark", sql)
 }
 
 #[derive(Clone, Debug)]

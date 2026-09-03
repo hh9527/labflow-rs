@@ -32,7 +32,7 @@ pub fn profile(plan: &Plan, artifact: &ArtifactName) -> AgentProfile {
         permission.insert(name.clone(), Value::String("allow".into()));
     }
     if definition.kind == ArtifactKind::Bench {
-        permission.insert("bash".into(), Value::String("allow".into()));
+        permission.insert("bash".into(), bench_commands(artifact));
     }
     permission.insert("glob".into(), Value::String("allow".into()));
     permission.insert("grep".into(), Value::String("deny".into()));
@@ -62,6 +62,22 @@ pub fn profile(plan: &Plan, artifact: &ArtifactName) -> AgentProfile {
         id: format!("{role_name}.{hash}"),
         content,
     }
+}
+
+fn bench_commands(artifact: &ArtifactName) -> Value {
+    let executable = ".labflow/bin/labflow";
+    let mut commands = Map::new();
+    commands.insert("*".into(), Value::String("deny".into()));
+    for command in [
+        format!("{executable} bench start {artifact}"),
+        format!("{executable} bench finish {artifact}"),
+        format!("{executable} challenge next {artifact}"),
+        format!("{executable} challenge clarify {artifact} *"),
+        format!("{executable} challenge archive {artifact}"),
+    ] {
+        commands.insert(command, Value::String("allow".into()));
+    }
+    Value::Object(commands)
 }
 
 pub fn respondent_profile(artifact: &ArtifactName, bench: &Bench) -> AgentProfile {
@@ -226,5 +242,35 @@ permissions = ["bash"]
             .join(format!("{}.md", first.id));
         fs::write(&path, "corrupt").unwrap();
         assert!(materialize(root.path(), &generated).is_err());
+    }
+
+    #[test]
+    fn bench_only_receives_its_protocol_commands() {
+        let plan = Plan::parse(
+            r#"version = 1
+[roles.evaluator]
+permissions = []
+[artifacts."score.evaluator"]
+kind = "bench"
+requires = ["system-active"]
+inputs = ["questions.jsonl"]
+[artifacts."score.evaluator".bench]
+name = "score"
+source = "questions.jsonl"
+"#,
+        )
+        .unwrap();
+        let profile = profile(&plan, &ArtifactName::parse("score.evaluator").unwrap());
+        assert!(!profile.content.contains(r#""bash":"allow""#));
+        assert!(profile.content.contains(r#""bash":{"*":"deny""#));
+        for command in [
+            ".labflow/bin/labflow bench start score.evaluator",
+            ".labflow/bin/labflow bench finish score.evaluator",
+            ".labflow/bin/labflow challenge next score.evaluator",
+            ".labflow/bin/labflow challenge clarify score.evaluator *",
+            ".labflow/bin/labflow challenge archive score.evaluator",
+        ] {
+            assert!(profile.content.contains(&format!(r#""{command}":"allow""#)));
+        }
     }
 }

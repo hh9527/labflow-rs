@@ -36,6 +36,11 @@ fn host_can_configure_publish_and_unpublish() {
     assert_eq!(Config::load(directory.path()).unwrap().port, 4096);
     let run = directory.path().join(".labflow/bin/run");
     assert!(run.is_file());
+    #[cfg(unix)]
+    assert_eq!(
+        fs::read_link(directory.path().join(".labflow/bin/labflow")).unwrap(),
+        fs::canonicalize(cargo_bin("labflow")).unwrap()
+    );
     assert!(
         Command::new("bash")
             .arg("-n")
@@ -673,6 +678,64 @@ commands = ["just verify"]
 }
 
 #[test]
+fn query_reads_and_joins_timeline_and_states_read_only() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join(".labflow")).unwrap();
+    let timeline = Connection::open(directory.path().join(".labflow/timeline.sqlite")).unwrap();
+    timeline
+        .execute_batch("CREATE TABLE turns(artifact TEXT); INSERT INTO turns VALUES ('answer.r');")
+        .unwrap();
+    let states = Connection::open(directory.path().join(".labflow/states.sqlite")).unwrap();
+    states
+        .execute_batch(
+            "CREATE TABLE artifacts(name TEXT); INSERT INTO artifacts VALUES ('answer.r');",
+        )
+        .unwrap();
+    drop(timeline);
+    drop(states);
+
+    let output = labflow()
+        .args([
+            "--root",
+            directory.path().to_str().unwrap(),
+            "query",
+            "-e",
+            "SELECT t.artifact FROM timeline.turns t JOIN states.artifacts s ON s.name = t.artifact",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({"columns": ["artifact"], "rows": [["answer.r"]]})
+    );
+
+    let output = labflow()
+        .args([
+            "--root",
+            directory.path().to_str().unwrap(),
+            "query",
+            "-e",
+            "DELETE FROM states.artifacts",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        Connection::open(directory.path().join(".labflow/states.sqlite"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM artifacts", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn host_cannot_publish_or_unpublish_learn_artifact() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(
@@ -812,6 +875,10 @@ fn run_script_tracks_backend_restart_and_shutdown() {
         fs::read_to_string(directory.path().join("backend-starts"))
             .is_ok_and(|content| content.lines().count() == 1)
     });
+    assert_eq!(
+        fs::read_link(directory.path().join(".labflow/bin/labflow")).unwrap(),
+        fs::canonicalize(cargo_bin("labflow")).unwrap()
+    );
     assert_eq!(
         fs::read_to_string(directory.path().join("launcher-env")).unwrap(),
         format!(

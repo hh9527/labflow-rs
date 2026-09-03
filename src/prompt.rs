@@ -22,7 +22,7 @@ pub fn build_task_prompt(
         .with_context(|| format!("unknown artifact `{name}`"))?;
     if artifact.kind == ArtifactKind::Bench {
         return Ok(format!(
-            "任务: {name}\n\n要求:\n- 执行 `labflow bench start {name}` 开始本轮评测\n- 反复执行 `labflow challenge next {name}`，根据返回的 Q、K 和 reply 决定是否使用 `labflow challenge clarify {name} '<澄清文本>'`\n- 每道题完成后执行 `labflow challenge archive {name}`\n- next 返回 null 后执行 `labflow bench finish {name}`\n- 完成后必须先严格回答“完成任务。”，然后再做其他解释\n- 确实无法完成，则必须先严格回答“无法完成任务。”，然后再做其他解释\n"
+            "任务: {name}\n\n要求:\n- 执行 `.labflow/bin/labflow bench start {name}` 开始本轮评测\n- 反复执行 `.labflow/bin/labflow challenge next {name}`，根据返回的 Q、K 和 reply 决定是否使用 `.labflow/bin/labflow challenge clarify {name} '<澄清文本>'`\n- 每道题完成后执行 `.labflow/bin/labflow challenge archive {name}`\n- next 返回 null 后执行 `.labflow/bin/labflow bench finish {name}`\n- 完成后必须先严格回答“完成任务。”，然后再做其他解释\n- 确实无法完成，则必须先严格回答“无法完成任务。”，然后再做其他解释\n"
         ));
     }
     let inputs = effective_inputs(root, plan, artifact)?;

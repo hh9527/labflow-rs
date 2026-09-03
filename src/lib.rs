@@ -7,4 +7,5 @@ pub mod db;
 pub mod domain;
 pub mod plan;
 pub mod prompt;
+pub mod query;
 pub mod runtime;
