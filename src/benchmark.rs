@@ -28,6 +28,7 @@ pub fn query(root: &Path, name: &BenchName, sql: &str) -> Result<QueryOutput> {
 pub enum Command {
     Start,
     Next,
+    PollReply,
     Clarify(String),
     Archive,
     Finish,
@@ -80,6 +81,8 @@ enum Event {
         error: String,
     },
     SessionAttached,
+    SubmissionAccepted,
+    PollExpired,
     Answered {
         round_id: i64,
         question: Question,
@@ -109,12 +112,17 @@ enum Effect {
         round_id: i64,
         session_id: String,
     },
-    Ask {
+    Submit {
         round_id: i64,
         session_id: String,
         question: Question,
         prompt: String,
         clarification: bool,
+    },
+    PollReply {
+        round_id: i64,
+        session_id: String,
+        question: Question,
     },
     SaveAnswer {
         round_id: i64,
@@ -163,6 +171,9 @@ enum Output {
     Reply {
         reply: String,
     },
+    Running {
+        status: &'static str,
+    },
 }
 
 #[derive(Serialize)]
@@ -179,6 +190,8 @@ struct CreateSessionResponse {
 
 #[derive(Serialize)]
 struct MessageRequest<'a> {
+    #[serde(rename = "messageID")]
+    message_id: &'a str,
     agent: &'a str,
     parts: [TextPart<'a>; 1],
 }
@@ -244,6 +257,9 @@ impl Event {
                     .context("attached session has no round")?;
                 Ok(vec![Effect::Output(Output::Round { round: round.id })])
             }
+            Self::SubmissionAccepted | Self::PollExpired => {
+                Ok(vec![Effect::Output(Output::Running { status: "running" })])
+            }
             Self::Requested(Command::Next) => {
                 let round = current_round(state)?;
                 if round
@@ -266,12 +282,29 @@ impl Event {
                     .session_id
                     .clone()
                     .context("current round has no respondent session")?;
-                Ok(vec![Effect::Ask {
+                Ok(vec![Effect::Submit {
                     round_id,
                     session_id,
                     question: question.clone(),
                     prompt: question.q.clone(),
                     clarification: false,
+                }])
+            }
+            Self::Requested(Command::PollReply) => {
+                let round = current_round(state)?;
+                let question = round
+                    .questions
+                    .iter()
+                    .find(|question| question.status == "current")
+                    .context("benchmark has no current question")?
+                    .clone();
+                Ok(vec![Effect::PollReply {
+                    round_id: round.id,
+                    session_id: round
+                        .session_id
+                        .clone()
+                        .context("current round has no respondent session")?,
+                    question,
                 }])
             }
             Self::Requested(Command::Clarify(text)) => {
@@ -286,7 +319,7 @@ impl Event {
                     bail!("current question already has three clarifications");
                 }
                 question.clarifications += 1;
-                Ok(vec![Effect::Ask {
+                Ok(vec![Effect::Submit {
                     round_id,
                     session_id,
                     question: question.clone(),
@@ -533,7 +566,7 @@ impl Effect {
                     },
                 }))
             }
-            Self::Ask {
+            Self::Submit {
                 round_id,
                 session_id,
                 question,
@@ -541,18 +574,34 @@ impl Effect {
                 clarification,
             } => {
                 let started_at = now()?;
+                let wire_prompt = if clarification {
+                    format!("补充：{prompt}")
+                } else {
+                    format!("题目：{prompt}")
+                };
+                let message_id =
+                    message_id(&session_id, round_id, &question.id, question.clarifications);
                 let mut connection = Connection::open(&context.records)?;
                 let transaction = connection.transaction()?;
                 if clarification {
+                    let previous_status: String = transaction.query_row(
+                        "SELECT status FROM turn WHERE bench_round_id = ?1 AND question_id = ?2 AND turn_index = ?3",
+                        params![round_id, question.id, question.clarifications - 1],
+                        |row| row.get(0),
+                    )?;
+                    if previous_status != "completed" {
+                        return Ok(Some(Event::PollExpired));
+                    }
                     transaction.execute(
-                        "INSERT INTO turn(bench_round_id, question_id, turn_index, is_last_turn, q, started_at)
-                         VALUES (?1, ?2, ?3, 0, ?4, ?5)",
-                        params![round_id, question.id, question.clarifications, prompt, started_at],
+                        "INSERT INTO turn(bench_round_id, question_id, turn_index, is_last_turn, q, started_at, message_id, status)
+                         VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, 'submitting')",
+                        params![round_id, question.id, question.clarifications, prompt, started_at, message_id],
                     )?;
                 } else {
                     transaction.execute(
-                        "UPDATE turn SET started_at = ?1 WHERE bench_round_id = ?2 AND question_id = ?3 AND turn_index = 0",
-                        params![started_at, round_id, question.id],
+                        "UPDATE turn SET started_at = ?1, message_id = ?2, status = 'submitting'
+                         WHERE bench_round_id = ?3 AND question_id = ?4 AND turn_index = 0",
+                        params![started_at, message_id, round_id, question.id],
                     )?;
                 }
                 transaction.execute(
@@ -560,49 +609,113 @@ impl Effect {
                     params![round_id, question.id],
                 )?;
                 transaction.commit()?;
-                let response = context
+                let submission = context
                     .client
                     .post(format!(
-                        "{}/session/{session_id}/message",
+                        "{}/session/{session_id}/prompt_async",
                         context.backend_url
                     ))
                     .query(&[("directory", context.root.to_string_lossy().as_ref())])
                     .json(&MessageRequest {
+                        message_id: &message_id,
                         agent: &context.respondent_id,
                         parts: [TextPart {
                             kind: "text",
-                            text: &prompt,
+                            text: &wire_prompt,
                         }],
                     })
                     .send()
-                    .await?
-                    .error_for_status()?;
-                let response: Value = response.json().await?;
-                let finished_at = now()?;
-                let parts = crate::opencode::turn_parts(
-                    &context.client,
-                    &context.backend_url,
-                    &context.root,
-                    &session_id,
-                    &response,
-                    Some(256),
-                )
-                .await;
-                let actions = response_actions(&parts, started_at, finished_at);
-                let reply = response_text(&response);
-                let mut question = question;
-                if !clarification {
-                    question.clarifications = 0;
+                    .await
+                    .and_then(reqwest::Response::error_for_status);
+                if let Err(error) = submission {
+                    let connection = Connection::open(&context.records)?;
+                    if clarification {
+                        connection.execute(
+                            "DELETE FROM turn WHERE bench_round_id = ?1 AND question_id = ?2 AND turn_index = ?3",
+                            params![round_id, question.id, question.clarifications],
+                        )?;
+                    } else {
+                        connection.execute(
+                            "UPDATE turn SET started_at = NULL, message_id = NULL, status = 'created'
+                             WHERE bench_round_id = ?1 AND question_id = ?2 AND turn_index = 0",
+                            params![round_id, question.id],
+                        )?;
+                        connection.execute(
+                            "UPDATE question SET status = 'pending' WHERE bench_round_id = ?1 AND question_id = ?2",
+                            params![round_id, question.id],
+                        )?;
+                    }
+                    return Err(error.into());
                 }
-                Ok(Some(Event::Answered {
-                    round_id,
-                    question,
-                    reply,
-                    clarification,
-                    started_at,
-                    finished_at,
-                    actions,
-                }))
+                Connection::open(&context.records)?.execute(
+                    "UPDATE turn SET status = 'running' WHERE bench_round_id = ?1 AND question_id = ?2 AND turn_index = ?3",
+                    params![round_id, question.id, question.clarifications],
+                )?;
+                Ok(Some(Event::SubmissionAccepted))
+            }
+            Self::PollReply {
+                round_id,
+                session_id,
+                question,
+            } => {
+                let (message_id, started_at, status, reply): (
+                    Option<String>,
+                    Option<i64>,
+                    String,
+                    Option<String>,
+                ) = Connection::open(&context.records)?.query_row(
+                    "SELECT message_id, started_at, status, a FROM turn
+                     WHERE bench_round_id = ?1 AND question_id = ?2 AND turn_index = ?3",
+                    params![round_id, question.id, question.clarifications],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
+                if status == "completed" {
+                    let reply = reply.unwrap_or_default();
+                    return Ok(Some(Event::AnswerSaved {
+                        question: question.clone(),
+                        reply,
+                        clarification: question.clarifications > 0,
+                    }));
+                }
+                let message_id = message_id.context("current challenge has not been submitted")?;
+                let started_at = started_at.context("current challenge has not been submitted")?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                loop {
+                    let messages = crate::opencode::turn_messages(
+                        &context.client,
+                        &context.backend_url,
+                        &context.root,
+                        &session_id,
+                        &message_id,
+                        Some(256),
+                    )
+                    .await?;
+                    let idle = session_is_idle(&context, &session_id).await?;
+                    if idle && !messages.is_empty() {
+                        let finished_at = now()?;
+                        let parts = messages
+                            .iter()
+                            .flat_map(|message| {
+                                message["parts"].as_array().cloned().unwrap_or_default()
+                            })
+                            .collect::<Vec<_>>();
+                        let reply = response_text(messages.last().expect("messages is non-empty"));
+                        let actions = response_actions(&parts, started_at, finished_at);
+                        return Ok(Some(Event::Answered {
+                            round_id,
+                            question: question.clone(),
+                            reply,
+                            clarification: question.clarifications > 0,
+                            started_at,
+                            finished_at,
+                            actions,
+                        }));
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Ok(Some(Event::PollExpired));
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
             }
             Self::SaveAnswer {
                 round_id,
@@ -617,7 +730,7 @@ impl Effect {
                 let transaction = connection.unchecked_transaction()?;
                 if clarification {
                     transaction.execute(
-                        "UPDATE turn SET a = ?1, finished_at = ?2
+                        "UPDATE turn SET a = ?1, finished_at = ?2, status = 'completed'
                          WHERE bench_round_id = ?3 AND question_id = ?4 AND turn_index = ?5",
                         params![
                             reply,
@@ -629,7 +742,7 @@ impl Effect {
                     )?;
                 } else {
                     transaction.execute(
-                        "UPDATE turn SET a = ?1, started_at = ?2, finished_at = ?3
+                        "UPDATE turn SET a = ?1, started_at = ?2, finished_at = ?3, status = 'completed'
                          WHERE bench_round_id = ?4 AND question_id = ?5 AND turn_index = 0",
                         params![reply, started_at, finished_at, round_id, question.id],
                     )?;
@@ -654,6 +767,14 @@ impl Effect {
             } => {
                 let mut connection = Connection::open(&context.records)?;
                 let transaction = connection.transaction()?;
+                let status: String = transaction.query_row(
+                    "SELECT status FROM turn WHERE bench_round_id = ?1 AND question_id = ?2 ORDER BY turn_index DESC LIMIT 1",
+                    params![round_id, question_id],
+                    |row| row.get(0),
+                )?;
+                if status != "completed" {
+                    return Ok(Some(Event::PollExpired));
+                }
                 transaction.execute(
                     "UPDATE question SET status = 'archived', archived_at = ?1 WHERE bench_round_id = ?2 AND question_id = ?3 AND status = 'current'",
                     params![now()?, round_id, question_id],
@@ -694,7 +815,7 @@ impl Effect {
 fn initialize(path: &Path) -> Result<()> {
     let connection = Connection::open(path)?;
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != 3 {
+    if version != 0 && version < 3 {
         connection.execute_batch(
             "DROP TABLE IF EXISTS question_turns;
              DROP TABLE IF EXISTS round_questions;
@@ -726,7 +847,7 @@ fn initialize(path: &Path) -> Result<()> {
          CREATE TABLE IF NOT EXISTS turn (
            bench_round_id INTEGER NOT NULL, question_id TEXT NOT NULL, turn_index INTEGER NOT NULL,
            is_last_turn INTEGER NOT NULL, q TEXT NOT NULL, a TEXT,
-           started_at INTEGER, finished_at INTEGER,
+           started_at INTEGER, finished_at INTEGER, message_id TEXT, status TEXT NOT NULL DEFAULT 'created',
            PRIMARY KEY(bench_round_id, question_id, turn_index)
          );
          CREATE UNIQUE INDEX IF NOT EXISTS one_last_turn ON turn(bench_round_id, question_id) WHERE is_last_turn = 1;
@@ -736,8 +857,18 @@ fn initialize(path: &Path) -> Result<()> {
            started_at INTEGER NOT NULL, finished_at INTEGER, result TEXT,
            PRIMARY KEY(bench_round_id, question_id, turn_index, action_index)
          );
-         PRAGMA user_version = 3;",
+         PRAGMA user_version = 4;",
     )?;
+    if version == 3 {
+        connection.execute_batch(
+            "ALTER TABLE turn ADD COLUMN message_id TEXT;
+             ALTER TABLE turn ADD COLUMN status TEXT NOT NULL DEFAULT 'created';
+             UPDATE turn SET status = CASE WHEN finished_at IS NULL THEN 'created' ELSE 'completed' END;
+             PRAGMA user_version = 4;",
+        )?;
+    } else if version > 4 {
+        bail!("benchmark database version {version} is newer than supported version 4");
+    }
     Ok(())
 }
 
@@ -898,6 +1029,27 @@ fn response_text(response: &Value) -> String {
     } else {
         text
     }
+}
+
+fn message_id(session_id: &str, round_id: i64, question_id: &str, turn_index: u8) -> String {
+    let value = format!("{session_id}:{round_id}:{question_id}:{turn_index}");
+    format!("msg_{:x}", Sha256::digest(value.as_bytes()))
+}
+
+async fn session_is_idle(context: &ContextData, session_id: &str) -> Result<bool> {
+    let statuses: Value = context
+        .client
+        .get(format!("{}/session/status", context.backend_url))
+        .query(&[("directory", context.root.to_string_lossy().as_ref())])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(statuses
+        .get(session_id)
+        .and_then(|status| status["type"].as_str())
+        .is_none_or(|status| status == "idle"))
 }
 
 fn response_actions(

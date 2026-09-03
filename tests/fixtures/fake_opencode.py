@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 session_count = 0
 benchmark_session = None
+benchmark_message = None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -20,19 +21,23 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_empty(self):
+        self.send_response(204)
+        self.end_headers()
+
     def do_GET(self):
         if self.path.startswith("/global/health"):
             self.send_json({"healthy": True, "version": "fake"})
         elif self.path.startswith("/session/ses_respondent/message?"):
             self.send_json([
-                {"info": {"id": "msg_respondent_step", "role": "assistant", "parentID": "msg_respondent_user", "time": {"created": 20}}, "parts": [
+                {"info": {"id": "msg_respondent_step", "role": "assistant", "parentID": benchmark_message, "time": {"created": 20}}, "parts": [
                     {"type": "reasoning", "time": {"start": 20, "end": 21}},
                     {"type": "tool", "tool": "bash", "state": {
                         "status": "completed", "input": {"command": "just verify"},
                         "time": {"start": 22, "end": 23},
                     }},
                 ]},
-                {"info": {"id": "msg_respondent", "role": "assistant", "parentID": "msg_respondent_user", "time": {"created": 24}}, "parts": [
+                {"info": {"id": "msg_respondent", "role": "assistant", "parentID": benchmark_message, "time": {"created": 24}}, "parts": [
                     {"type": "text", "text": "respondent reply"},
                 ]},
             ])
@@ -49,6 +54,8 @@ class Handler(BaseHTTPRequestHandler):
                     {"type": "text", "text": "完成任务。"},
                 ]},
             ])
+        elif self.path.startswith("/session/status?"):
+            self.send_json({})
         elif self.path.startswith("/event"):
             body = b'data: {"type":"server.connected","properties":{}}\n\n'
             self.send_response(200)
@@ -60,7 +67,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        global session_count, benchmark_session
+        global session_count, benchmark_session, benchmark_message
         length = int(self.headers.get("content-length", "0"))
         body = json.loads(self.rfile.read(length) or b"{}")
         if self.path.startswith("/session?"):
@@ -84,15 +91,14 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_error(400)
                     return
                 self.send_json({"id": "ses_worker"})
-        elif self.path.startswith("/session/ses_respondent/message?"):
+        elif self.path.startswith("/session/ses_respondent/prompt_async?"):
+            if not body.get("messageID", "").startswith("msg_"):
+                self.send_error(400)
+                return
+            benchmark_message = body["messageID"]
             with open(os.path.join(os.getcwd(), "benchmark-messages.jsonl"), "a", encoding="utf-8") as output:
                 output.write(json.dumps(body) + "\n")
-            self.send_json({
-                "info": {"id": "msg_respondent", "parentID": "msg_respondent_user"},
-                "parts": [
-                    {"type": "text", "text": "respondent reply"},
-                ],
-            })
+            self.send_empty()
         elif self.path.startswith("/session/ses_worker/message?"):
             if not body.get("agent", "").startswith("researcher."):
                 self.send_error(400)

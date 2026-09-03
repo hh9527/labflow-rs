@@ -3,6 +3,34 @@ use std::path::Path;
 use reqwest::Client;
 use serde_json::Value;
 
+pub async fn turn_messages(
+    client: &Client,
+    backend_url: &str,
+    root: &Path,
+    session_id: &str,
+    parent_id: &str,
+    limit: Option<usize>,
+) -> anyhow::Result<Vec<Value>> {
+    let mut request = client
+        .get(format!("{backend_url}/session/{session_id}/message"))
+        .query(&[("directory", root.to_string_lossy().as_ref())]);
+    if let Some(limit) = limit {
+        request = request.query(&[("limit", limit)]);
+    }
+    let mut messages = request
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<Value>>()
+        .await?;
+    messages.retain(|message| {
+        message["info"]["role"] == "assistant"
+            && message["info"]["parentID"].as_str() == Some(parent_id)
+    });
+    messages.sort_by_key(|message| message["info"]["time"]["created"].as_i64());
+    Ok(messages)
+}
+
 pub async fn turn_parts(
     client: &Client,
     backend_url: &str,
@@ -16,26 +44,10 @@ pub async fn turn_parts(
         return fallback;
     };
 
-    let mut request = client
-        .get(format!("{backend_url}/session/{session_id}/message"))
-        .query(&[("directory", root.to_string_lossy().as_ref())]);
-    if let Some(limit) = limit {
-        request = request.query(&[("limit", limit)]);
-    }
-    let Ok(response) = request.send().await else {
+    let Ok(messages) = turn_messages(client, backend_url, root, session_id, parent_id, limit).await
+    else {
         return fallback;
     };
-    let Ok(response) = response.error_for_status() else {
-        return fallback;
-    };
-    let Ok(mut messages) = response.json::<Vec<Value>>().await else {
-        return fallback;
-    };
-    messages.retain(|message| {
-        message["info"]["role"] == "assistant"
-            && message["info"]["parentID"].as_str() == Some(parent_id)
-    });
-    messages.sort_by_key(|message| message["info"]["time"]["created"].as_i64());
     let parts = messages
         .into_iter()
         .flat_map(|message| message["parts"].as_array().cloned().unwrap_or_default())

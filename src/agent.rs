@@ -82,6 +82,7 @@ fn bench_commands(artifact: &ArtifactName) -> Vec<String> {
         format!("{executable} bench start {artifact}"),
         format!("{executable} bench finish {artifact}"),
         format!("{executable} challenge next {artifact}"),
+        format!("{executable} challenge poll-reply {artifact}"),
         format!("{executable} challenge clarify {artifact} *"),
         format!("{executable} challenge archive {artifact}"),
     ]
@@ -345,6 +346,7 @@ source = "questions.jsonl"
             ".labflow/bin/labflow bench start score.evaluator",
             ".labflow/bin/labflow bench finish score.evaluator",
             ".labflow/bin/labflow challenge next score.evaluator",
+            ".labflow/bin/labflow challenge poll-reply score.evaluator",
             ".labflow/bin/labflow challenge clarify score.evaluator *",
             ".labflow/bin/labflow challenge archive score.evaluator",
         ] {

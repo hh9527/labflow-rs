@@ -538,6 +538,32 @@ commands = ["just verify"]
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["status"],
+        "running"
+    );
+    for arguments in [
+        vec!["challenge", "archive", "bench-solver.challenger"],
+        vec![
+            "challenge",
+            "clarify",
+            "bench-solver.challenger",
+            "too early",
+        ],
+    ] {
+        let output = invoke(&arguments);
+        assert!(output.status.success());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["status"],
+            "running"
+        );
+    }
+    let output = invoke(&["challenge", "poll-reply", "bench-solver.challenger"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let answer: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(answer["Q"], "solve it");
     assert_eq!(answer["K"], "hidden hint");
@@ -554,6 +580,11 @@ commands = ["just verify"]
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["status"],
+        "running"
+    );
+    let output = invoke(&["challenge", "poll-reply", "bench-solver.challenger"]);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["reply"],
         "respondent reply"
@@ -645,6 +676,17 @@ commands = ["just verify"]
         )
         .unwrap();
     assert_eq!(command, "just verify");
+    let prompts = fs::read_to_string(directory.path().join("benchmark-messages.jsonl")).unwrap();
+    let prompts = prompts
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["parts"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prompts, vec!["题目：solve it", "补充：use the public rule"]);
 
     let output = invoke(&[
         "query-bench",

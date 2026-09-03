@@ -87,6 +87,7 @@ enum BenchCommand {
 #[derive(Debug, Subcommand)]
 enum ChallengeCommand {
     Next { name: String },
+    PollReply { name: String },
     Clarify { name: String, text: String },
     Archive { name: String },
 }
@@ -147,6 +148,9 @@ pub async fn run() -> Result<()> {
         Command::Challenge { command } => match command {
             ChallengeCommand::Next { name } => {
                 benchmark::run(root, name, benchmark::Command::Next).await
+            }
+            ChallengeCommand::PollReply { name } => {
+                benchmark::run(root, name, benchmark::Command::PollReply).await
             }
             ChallengeCommand::Clarify { name, text } => {
                 benchmark::run(root, name, benchmark::Command::Clarify(text)).await
