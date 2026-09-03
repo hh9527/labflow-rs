@@ -138,10 +138,12 @@ Host 可以按稳定的 `bench.name` 对 records 执行只读分析查询：
 ```text
 labflow query-bench solver -e 'SELECT * FROM bench_round'
 labflow query-bench solver -f analysis.sql
+printf 'SELECT * FROM question' | labflow query-bench solver -f -
 ```
 
 `-e/--execute` 与 `-f/--file` 必须且只能指定一个；相对 SQL 文件名以实验室根
-目录解析。命令使用 SQLite read-only connection，数据库不存在或 SQL 尝试写入
+目录解析，`-f -` 从 stdin 读取到 EOF。命令使用 SQLite read-only connection，
+数据库不存在或 SQL 尝试写入
 时返回非零。成功结果为 `{"columns":[...],"rows":[...]}` JSON，SQL NULL、整数、
 浮点数和文本映射为对应 JSON 类型，BLOB 映射为 `{"base64":"..."}`。
 

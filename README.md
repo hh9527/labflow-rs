@@ -23,6 +23,7 @@ labflow publish '!query-request'
 labflow host-tasks --poll 60
 labflow query-bench solver -e 'SELECT * FROM bench_round'
 labflow query-bench solver -f analysis.sql
+printf 'SELECT * FROM question' | labflow query-bench solver -f -
 labflow status
 ```
 
@@ -88,7 +89,8 @@ commands = ["just verify"]
 `K`、参考答案 `R` 和 `tags` 均可选。
 
 `query-bench` 使用 `bench.name` 定位内部数据库。`-e/--execute` 接受内联 SQL，
-`-f/--file` 从实验室根目录读取 SQL 文件，两者必须且只能指定一个。数据库以
+`-f/--file` 从实验室根目录读取 SQL 文件，两者必须且只能指定一个；`-f -` 从
+标准输入读取到 EOF。数据库以
 只读模式打开，结果输出为 `{"columns":[...],"rows":[...]}` JSON；BLOB 表示为
 `{"base64":"..."}`。
 

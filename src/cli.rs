@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -121,6 +122,13 @@ pub async fn run() -> Result<()> {
         Command::QueryBench(arguments) => {
             let sql = match (arguments.execute, arguments.file) {
                 (Some(sql), None) => sql,
+                (None, Some(path)) if path == Path::new("-") => {
+                    let mut sql = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut sql)
+                        .context("failed to read SQL from stdin")?;
+                    sql
+                }
                 (None, Some(path)) => {
                     let path = if path.is_absolute() {
                         path

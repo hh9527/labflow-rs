@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -589,6 +590,32 @@ commands = ["just verify"]
             "columns": ["tag", "count(*)"],
             "rows": [["hard", 1], ["logic", 1]]
         })
+    );
+
+    let mut child = labflow()
+        .args([
+            "--root",
+            directory.path().to_str().unwrap(),
+            "query-bench",
+            "solver",
+            "-f",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"SELECT count(*) FROM question")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({"columns": ["count(*)"], "rows": [[1]]})
     );
 
     let output = invoke(&["query-bench", "solver", "-e", "DELETE FROM question_tag"]);
