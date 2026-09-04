@@ -475,6 +475,7 @@ kind = "bench"
 name = "solver"
 public-knowledge = ["public/"]
 source = "questions.jsonl"
+selector = "selector.json"
 [artifacts."bench-solver.challenger".bench.permissions]
 write = ["workspace/result.json"]
 commands = ["just verify"]
@@ -483,7 +484,12 @@ commands = ["just verify"]
     .unwrap();
     fs::write(
         directory.path().join("questions.jsonl"),
-        "{\"id\":\"q1\",\"Q\":\"solve it\",\"K\":\"hidden hint\",\"R\":\"reference\",\"tags\":[\"logic\",\"hard\"]}\n",
+        "{\"id\":\"q1\",\"Q\":\"solve it\",\"K\":\"hidden hint\",\"R\":\"reference\",\"tags\":[\"logic\",\"hard\"]}\n{\"id\":\"q2\",\"Q\":\"skip it\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("selector.json"),
+        "{\"only\":[\"q1\"]}\n",
     )
     .unwrap();
     let plan = Plan::load(directory.path()).unwrap();

@@ -64,6 +64,7 @@ pub enum ArtifactKind {
 pub struct Bench {
     pub name: BenchName,
     pub source: FilePath,
+    pub selector: Option<FilePath>,
     #[serde(default, rename = "public-knowledge")]
     pub public_knowledge: Vec<AssetPath>,
     #[serde(default)]
@@ -375,6 +376,9 @@ impl Plan {
         }
         if let Some(bench) = &artifact.bench {
             inputs.push(bench.source.0.clone());
+            if let Some(selector) = &bench.selector {
+                inputs.push(selector.0.clone());
+            }
             inputs.extend(bench.public_knowledge.iter().cloned());
         }
         inputs
@@ -674,6 +678,7 @@ kind = "bench"
 [artifacts."bench-solver.r".bench]
 name = "solver"
 source = "questions.jsonl"
+selector = "selector.json"
 "#,
         )
         .unwrap();
@@ -684,6 +689,13 @@ source = "questions.jsonl"
             vec![
                 AssetPath::parse("knowledge/", true).unwrap(),
                 AssetPath::parse("learn.md", true).unwrap(),
+            ]
+        );
+        assert_eq!(
+            plan.artifact_inputs(&ArtifactName::parse("bench-solver.r").unwrap()),
+            vec![
+                AssetPath::parse("questions.jsonl", true).unwrap(),
+                AssetPath::parse("selector.json", true).unwrap(),
             ]
         );
 

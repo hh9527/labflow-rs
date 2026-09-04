@@ -547,10 +547,7 @@ impl Effect {
                 remove_public_context(&context)?;
                 let mut connection = Connection::open(&context.records)?;
                 let now = now()?;
-                let configuration_revision = format!(
-                    "{:x}",
-                    Sha256::digest(fs::read(context.root.join(PLAN_FILE))?)
-                );
+                let configuration_revision = configuration_revision(&context)?;
                 let transaction = connection.transaction()?;
                 transaction.execute(
                     "INSERT INTO bench_round(status, respondent, started_at, configuration_revision) VALUES ('current', ?1, ?2, ?3)",
@@ -1001,10 +998,17 @@ struct SourceQuestion {
     tags: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceSelector {
+    #[serde(default)]
+    only: Option<Vec<String>>,
+}
+
 fn load_questions(context: &ContextData) -> Result<Vec<Question>> {
     let source = fs::read_to_string(context.benchmark.source.resolve(&context.root))?;
     let mut ids = BTreeSet::new();
-    source
+    let questions = source
         .lines()
         .enumerate()
         .filter(|(_, line)| !line.trim().is_empty())
@@ -1037,7 +1041,68 @@ fn load_questions(context: &ContextData) -> Result<Vec<Question>> {
                 clarifications: 0,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    match &context.benchmark.selector {
+        None => Ok(questions),
+        Some(path) => {
+            let selector: SourceSelector =
+                serde_json::from_slice(&fs::read(path.resolve(&context.root))?)
+                    .with_context(|| format!("invalid challenge selector `{}`", path.as_str()))?;
+            apply_selector(questions, selector)
+        }
+    }
+}
+
+fn configuration_revision(context: &ContextData) -> Result<String> {
+    let mut digest = Sha256::new();
+    for path in [
+        Some(context.root.join(PLAN_FILE)),
+        Some(context.benchmark.source.resolve(&context.root)),
+        context
+            .benchmark
+            .selector
+            .as_ref()
+            .map(|path| path.resolve(&context.root)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let bytes = fs::read(&path).with_context(|| {
+            format!(
+                "failed to read benchmark configuration `{}`",
+                path.display()
+            )
+        })?;
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn apply_selector(questions: Vec<Question>, selector: SourceSelector) -> Result<Vec<Question>> {
+    let Some(only) = selector.only else {
+        return Ok(questions);
+    };
+    if only.is_empty() {
+        bail!("challenge selector `only` must not be empty");
+    }
+    let mut selected = BTreeSet::new();
+    for id in only {
+        if !selected.insert(id.clone()) {
+            bail!("duplicate question id `{id}` in challenge selector");
+        }
+    }
+    let source_ids = questions
+        .iter()
+        .map(|question| question.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if let Some(id) = selected.iter().find(|id| !source_ids.contains(id.as_str())) {
+        bail!("challenge selector references unknown question id `{id}`");
+    }
+    Ok(questions
+        .into_iter()
+        .filter(|question| selected.contains(&question.id))
+        .collect())
 }
 
 fn respondent_permissions(benchmark: &Bench) -> Vec<PermissionRule> {
@@ -1313,7 +1378,20 @@ impl Drop for Lock {
 mod tests {
     use serde_json::json;
 
-    use super::{SourceQuestion, response_text};
+    use super::{Question, SourceQuestion, SourceSelector, apply_selector, response_text};
+
+    fn question(id: &str, ordinal: i64) -> Question {
+        Question {
+            ordinal,
+            id: id.into(),
+            q: format!("question {id}"),
+            k: String::new(),
+            reference_answer: None,
+            tags: vec![],
+            status: "pending".into(),
+            clarifications: 0,
+        }
+    }
 
     #[test]
     fn hidden_knowledge_may_be_missing_or_null() {
@@ -1335,5 +1413,38 @@ mod tests {
         );
         let empty = json!({"parts": []});
         assert_eq!(response_text(&empty), "[OpenCode returned no text]");
+    }
+
+    #[test]
+    fn selector_filters_in_source_order() {
+        let questions = vec![question("q1", 0), question("q2", 1), question("q3", 2)];
+        let selected = apply_selector(
+            questions,
+            SourceSelector {
+                only: Some(vec!["q3".into(), "q1".into()]),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|question| question.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["q1", "q3"]
+        );
+    }
+
+    #[test]
+    fn selector_rejects_empty_duplicate_and_unknown_ids() {
+        for only in [
+            vec![],
+            vec!["q1".into(), "q1".into()],
+            vec!["missing".into()],
+        ] {
+            assert!(
+                apply_selector(vec![question("q1", 0)], SourceSelector { only: Some(only) })
+                    .is_err()
+            );
+        }
     }
 }
