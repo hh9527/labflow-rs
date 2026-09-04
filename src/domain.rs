@@ -418,6 +418,18 @@ fn reduce_supervisor_started(state: &mut State) -> Vec<Effect> {
     let mut roles_creating = BTreeSet::new();
     let mut observer_needed = false;
     for artifact in artifacts {
+        if state.plan.artifacts[&artifact]
+            .gate
+            .as_ref()
+            .is_some_and(|gate| state.timestamp(gate).is_none())
+        {
+            state.tasks.remove(&artifact);
+            effects.push(Effect::PersistTask {
+                artifact,
+                task: None,
+            });
+            continue;
+        }
         let role = artifact.role().expect("tasks belong to roles").to_owned();
         let task = state.tasks.get_mut(&artifact).expect("task exists");
         let profile = crate::agent::profile(&state.plan, &artifact);
@@ -981,8 +993,18 @@ fn schedule(state: &mut State) -> Vec<Effect> {
                     state
                         .timestamp(&dependency.name)
                         .is_some_and(|input| output.is_none_or(|output| input > output))
+                })
+                || artifact.gate.as_ref().is_some_and(|gate| {
+                    state
+                        .timestamp(gate)
+                        .is_some_and(|gate_at| output.is_none_or(|output_at| gate_at > output_at))
                 });
-            required_exist && stale
+            let gate_ready = artifact.gate.as_ref().is_none_or(|gate| {
+                state
+                    .timestamp(gate)
+                    .is_some_and(|gate_at| output.is_none_or(|output_at| gate_at > output_at))
+            });
+            required_exist && stale && gate_ready
         })
         .map(|(name, _)| name.clone())
         .collect();
@@ -1066,6 +1088,13 @@ fn compute_host_tasks(state: &State) -> HostTasks {
             });
         if !stale {
             continue;
+        }
+        if let Some(gate) = &artifact.gate
+            && !state
+                .timestamp(gate)
+                .is_some_and(|gate_at| output.is_none_or(|output_at| gate_at > output_at))
+        {
+            required.insert(gate.clone());
         }
         for dependency in &artifact.requires {
             let active_decision = dependency.name.as_str() == "system-active" && !state.is_active();
@@ -1172,6 +1201,72 @@ mod tests {
         }
         .reduce(&mut state);
         assert_eq!(state.observer_session.as_deref(), Some("current"));
+    }
+
+    fn gated_bench_state() -> State {
+        let plan = Plan::parse(
+            r#"
+version = 1
+[roles.evaluator]
+[artifacts.input]
+[artifacts.run]
+[artifacts."suite.evaluator"]
+kind = "bench"
+gate = "run"
+requires = ["system-active", "input"]
+[artifacts."suite.evaluator".bench]
+name = "suite"
+source = "suite.jsonl"
+"#,
+        )
+        .unwrap();
+        let mut state = State::new(Arc::new(plan));
+        state.backend_ready = true;
+        state
+            .artifacts
+            .insert(ArtifactName::parse("system-supervisor").unwrap(), Some(1));
+        state
+            .artifacts
+            .insert(ArtifactName::parse("system-active").unwrap(), Some(1));
+        state
+            .artifacts
+            .insert(ArtifactName::parse("input").unwrap(), Some(20));
+        state
+    }
+
+    #[test]
+    fn bench_gate_must_be_newer_than_output() {
+        let mut state = gated_bench_state();
+        let output = ArtifactName::parse("suite.evaluator").unwrap();
+        let gate = ArtifactName::parse("run").unwrap();
+        state.artifacts.insert(output.clone(), Some(10));
+        state.artifacts.insert(gate.clone(), Some(5));
+
+        assert!(schedule(&mut state).is_empty());
+        assert!(!state.tasks.contains_key(&output));
+        assert_eq!(compute_host_tasks(&state).tasks, vec![gate.clone()]);
+
+        state.artifacts.insert(gate, Some(21));
+        assert!(!schedule(&mut state).is_empty());
+        assert!(state.tasks.contains_key(&output));
+    }
+
+    #[test]
+    fn startup_cancels_persisted_task_when_gate_was_unpublished() {
+        let mut state = gated_bench_state();
+        let artifact = ArtifactName::parse("suite.evaluator").unwrap();
+        let gate = ArtifactName::parse("run").unwrap();
+        state.artifacts.insert(gate.clone(), Some(21));
+        schedule(&mut state);
+        assert!(state.tasks.contains_key(&artifact));
+
+        state.artifacts.insert(gate, None);
+        let effects = Event::SupervisorStarted.reduce(&mut state);
+        assert!(!state.tasks.contains_key(&artifact));
+        assert!(effects.contains(&Effect::PersistTask {
+            artifact,
+            task: None,
+        }));
     }
 
     #[test]

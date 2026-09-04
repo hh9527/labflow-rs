@@ -77,8 +77,11 @@ kind = "learn"
 goal = "goals/learn-domain.md"
 inputs = ["knowledge/domain/"]
 
+[artifacts.bench-answer-run]
+
 [artifacts."bench-answer.evaluator"]
 kind = "bench"
+gate = "bench-answer-run"
 requires = ["answer.researcher"]
 
 [artifacts."bench-answer.evaluator".bench]
@@ -94,6 +97,12 @@ commands = ["just verify"]
 `source` 是本轮完整、有序的 JSONL 题集，每行格式为
 `{"id":"q1","Q":"...","K":"...","R":"...","tags":["..."]}`；
 `K`、参考答案 `R` 和 `tags` 均可选。
+
+`gate` 是 Bench 可选的显式 Host 门控，必须引用一个非角色
+artifact，且不再重复写入 `requires`。只有 gate 已发布且比上次 Bench
+输出更新时才会调度；其它依赖更新只会让 Host 再次看到 gate 决策项，不会
+复用旧 gate 自动重跑。若 Host 撤销 gate 后 supervisor 重启，对应的持久化
+Bench task 会在恢复前取消。
 
 `query-bench` 使用 `bench.name` 定位内部数据库。`-e/--execute` 接受内联 SQL，
 `-f/--file` 从实验室根目录读取 SQL 文件，两者必须且只能指定一个；`-f -` 从

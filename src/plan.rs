@@ -36,6 +36,7 @@ pub struct Artifact {
     pub kind: ArtifactKind,
     #[serde(default, rename = "requires")]
     pub requires: Vec<Dependency>,
+    pub gate: Option<ArtifactName>,
     #[serde(default)]
     pub goal: Option<FilePath>,
     #[serde(default)]
@@ -440,6 +441,24 @@ fn validate_dependencies(
                 );
             }
         }
+        if let Some(gate) = &artifact.gate {
+            if artifact.kind != ArtifactKind::Bench {
+                bail!("artifact `{name}` uses `gate`, but only bench artifacts may be gated");
+            }
+            if gate.role().is_some() || gate.is_supervisor() {
+                bail!("bench artifact `{name}` gate `{gate}` must be a Host artifact");
+            }
+            if !artifacts.contains_key(gate) {
+                bail!("bench artifact `{name}` has unknown gate `{gate}`");
+            }
+            if artifact
+                .requires
+                .iter()
+                .any(|dependency| dependency.name == *gate)
+            {
+                bail!("bench artifact `{name}` gate `{gate}` must not also appear in `requires`");
+            }
+        }
     }
     Ok(())
 }
@@ -609,6 +628,36 @@ commands = ["  "]
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("unknown field `depends-on`"));
+    }
+
+    #[test]
+    fn validates_explicit_bench_gates() {
+        let valid = r#"
+version = 1
+[roles.r]
+[artifacts.run]
+[artifacts."suite.r"]
+kind = "bench"
+gate = "run"
+[artifacts."suite.r".bench]
+name = "suite"
+source = "suite.jsonl"
+"#;
+        let plan = Plan::parse(valid).unwrap();
+        assert_eq!(
+            plan.artifacts[&ArtifactName::parse("suite.r").unwrap()]
+                .gate
+                .as_ref()
+                .map(ArtifactName::as_str),
+            Some("run")
+        );
+
+        let duplicate = valid.replace("gate = \"run\"", "gate = \"run\"\nrequires = [\"run\"]");
+        assert!(Plan::parse(&duplicate).is_err());
+        let worker_gate = valid
+            .replace("[artifacts.run]", "[artifacts.\"other.r\"]")
+            .replace("gate = \"run\"", "gate = \"other.r\"");
+        assert!(Plan::parse(&worker_gate).is_err());
     }
 
     #[test]
