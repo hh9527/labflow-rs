@@ -24,6 +24,60 @@ pub fn query(root: &Path, name: &BenchName, sql: &str) -> Result<QueryOutput> {
     query_database(&path, "benchmark", sql)
 }
 
+pub async fn abort_current(
+    root: &Path,
+    bench: &Bench,
+    client: &Client,
+    backend_url: &str,
+) -> Result<()> {
+    let path = root
+        .join(".labflow/benchmarks")
+        .join(format!("{}.sqlite", bench.name.as_str()));
+    if !path.exists() {
+        return Ok(());
+    }
+    let connection = Connection::open(&path)?;
+    let current = connection
+        .query_row(
+            "SELECT id, session_id FROM bench_round WHERE status = 'current'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((round_id, session_id)) = current else {
+        return Ok(());
+    };
+    if let Some(session_id) = session_id {
+        client
+            .post(format!("{backend_url}/session/{session_id}/abort"))
+            .query(&[("directory", root.to_string_lossy().as_ref())])
+            .json(&serde_json::json!({}))
+            .send()
+            .await?
+            .error_for_status()?;
+        client
+            .delete(format!("{backend_url}/session/{session_id}"))
+            .query(&[("directory", root.to_string_lossy().as_ref())])
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+    connection.execute(
+        "UPDATE bench_round SET status = 'interrupted', finished_at = ?1, session_id = NULL WHERE id = ?2 AND status = 'current'",
+        params![now()?, round_id],
+    )?;
+    remove_public_context(&ContextData {
+        root: root.to_path_buf(),
+        name: bench.name.as_str().to_owned(),
+        benchmark: bench.clone(),
+        respondent_id: String::new(),
+        records: path,
+        client: client.clone(),
+        backend_url: backend_url.to_owned(),
+    })?;
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub enum Command {
     Start,

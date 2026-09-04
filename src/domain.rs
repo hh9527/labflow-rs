@@ -274,6 +274,11 @@ pub enum Effect {
         artifact: ArtifactName,
         request_id: u64,
     },
+    CancelTask {
+        artifact: ArtifactName,
+        request_id: u64,
+        session_id: String,
+    },
     Log {
         message: String,
     },
@@ -423,7 +428,16 @@ fn reduce_supervisor_started(state: &mut State) -> Vec<Effect> {
             .as_ref()
             .is_some_and(|gate| state.timestamp(gate).is_none())
         {
-            state.tasks.remove(&artifact);
+            let task = state.tasks.remove(&artifact).expect("task exists");
+            if let Some(role) = artifact.role()
+                && let Some(session) = state.sessions.get(role)
+            {
+                effects.push(Effect::CancelTask {
+                    artifact: artifact.clone(),
+                    request_id: task.request_id,
+                    session_id: session.id.clone(),
+                });
+            }
             effects.push(Effect::PersistTask {
                 artifact,
                 task: None,
@@ -645,6 +659,36 @@ fn reduce_artifact_observed(
         _ => {}
     }
 
+    if modified.is_none() {
+        let gated: Vec<_> = state
+            .tasks
+            .keys()
+            .filter(|artifact| state.plan.artifacts[*artifact].gate.as_ref() == Some(&name))
+            .cloned()
+            .collect();
+        for artifact in gated {
+            let task = state.tasks.remove(&artifact).expect("task exists");
+            if let Some(role) = artifact.role()
+                && let Some(session) = state.sessions.get_mut(role)
+            {
+                session.busy = false;
+                effects.push(Effect::PersistSession {
+                    role: role.to_owned(),
+                    session: session.clone(),
+                });
+                effects.push(Effect::CancelTask {
+                    artifact: artifact.clone(),
+                    request_id: task.request_id,
+                    session_id: session.id.clone(),
+                });
+            }
+            effects.push(Effect::PersistTask {
+                artifact,
+                task: None,
+            });
+        }
+    }
+
     if modified.is_some()
         && let Some(task) = state.tasks.get(&name)
         && task.status == TaskStatus::Publishing
@@ -825,7 +869,11 @@ fn reduce_task_answered(
             effects
         }
         TaskAnswer::Unable => block_task(state, artifact, session_effect),
-        TaskAnswer::Invalid => fail_task(state, artifact, "回答内容不符合要求".into()),
+        TaskAnswer::Invalid => fail_task(
+            state,
+            artifact,
+            "回答内容不符合要求：没有以\"完成任务。\"或者\"无法完成任务。\"作为开头".into(),
+        ),
     }
 }
 
@@ -1259,14 +1307,58 @@ source = "suite.jsonl"
         state.artifacts.insert(gate.clone(), Some(21));
         schedule(&mut state);
         assert!(state.tasks.contains_key(&artifact));
+        state.sessions.insert(
+            "evaluator".into(),
+            Session {
+                id: "ses_evaluator".into(),
+                busy: true,
+            },
+        );
 
         state.artifacts.insert(gate, None);
         let effects = Event::SupervisorStarted.reduce(&mut state);
         assert!(!state.tasks.contains_key(&artifact));
         assert!(effects.contains(&Effect::PersistTask {
-            artifact,
+            artifact: artifact.clone(),
             task: None,
         }));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::CancelTask { artifact: cancelled, .. } if cancelled == &artifact
+        )));
+    }
+
+    #[test]
+    fn unpublishing_gate_cancels_running_bench_immediately() {
+        let mut state = gated_bench_state();
+        let artifact = ArtifactName::parse("suite.evaluator").unwrap();
+        let gate = ArtifactName::parse("run").unwrap();
+        state.artifacts.insert(gate.clone(), Some(21));
+        schedule(&mut state);
+        state.sessions.insert(
+            "evaluator".into(),
+            Session {
+                id: "ses_evaluator".into(),
+                busy: true,
+            },
+        );
+
+        let effects = Event::ArtifactObserved {
+            name: gate,
+            modified: None,
+        }
+        .reduce(&mut state);
+
+        assert!(!state.tasks.contains_key(&artifact));
+        assert!(!state.sessions["evaluator"].busy);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::CancelTask {
+                artifact: cancelled,
+                session_id,
+                ..
+            } if cancelled == &artifact && session_id == "ses_evaluator"
+        )));
     }
 
     #[test]
@@ -1559,6 +1651,37 @@ requires = ["system-active"]
             state
                 .virtual_artifacts
                 .contains_key(&ArtifactName::parse("_blocked").unwrap())
+        );
+    }
+
+    #[test]
+    fn invalid_answer_reports_required_prefixes() {
+        let mut state = state();
+        let artifact = ArtifactName::parse("answer.researcher").unwrap();
+        state.tasks.insert(
+            artifact.clone(),
+            Task {
+                status: TaskStatus::Running,
+                retries: 0,
+                failures: vec![],
+                request_id: 1,
+                agent_id: "researcher.test".into(),
+                longest_reasoning_ms: None,
+            },
+        );
+
+        Event::TaskAnswered {
+            artifact: artifact.clone(),
+            request_id: 1,
+            agent_id: "researcher.test".into(),
+            content: "已经完成。".into(),
+            longest_reasoning_ms: 3,
+        }
+        .reduce(&mut state);
+
+        assert_eq!(
+            state.tasks[&artifact].failures,
+            ["回答内容不符合要求：没有以\"完成任务。\"或者\"无法完成任务。\"作为开头"]
         );
     }
 

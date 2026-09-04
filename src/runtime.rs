@@ -520,6 +520,45 @@ impl Effect {
                 }
                 Ok(())
             }
+            Effect::CancelTask {
+                artifact,
+                request_id,
+                session_id,
+            } => {
+                if let Some(bench) = context
+                    .plan
+                    .artifacts
+                    .get(&artifact)
+                    .and_then(|definition| definition.bench.as_ref())
+                {
+                    crate::benchmark::abort_current(
+                        &context.root,
+                        bench,
+                        &context.client,
+                        &context.backend_url,
+                    )
+                    .await?;
+                }
+                context
+                    .client
+                    .post(format!(
+                        "{}/session/{session_id}/abort",
+                        context.backend_url
+                    ))
+                    .query(&[("directory", context.root.to_string_lossy().as_ref())])
+                    .json(&json!({}))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                context.databases.finish_timeline_turn(
+                    request_id,
+                    system_time_micros(SystemTime::now()),
+                    "interrupted",
+                    None,
+                    None,
+                )?;
+                Ok(())
+            }
             Effect::ReportRefreshStarted { artifact } => {
                 println!("[{}] {artifact} 已经启动刷新", local_datetime());
                 Ok(())
