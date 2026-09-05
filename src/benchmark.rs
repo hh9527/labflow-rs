@@ -645,7 +645,7 @@ impl Effect {
                 let wire_prompt = if clarification {
                     format!("补充：{prompt}")
                 } else {
-                    format!("题目：{prompt}")
+                    format!("next，题目：{prompt}")
                 };
                 let message_id =
                     message_id(&session_id, round_id, &question.id, question.clarifications);

@@ -734,7 +734,10 @@ commands = ["just verify"]
                 .to_owned()
         })
         .collect::<Vec<_>>();
-    assert_eq!(prompts, vec!["题目：solve it", "补充：use the public rule"]);
+    assert_eq!(
+        prompts,
+        vec!["next，题目：solve it", "补充：use the public rule"]
+    );
 
     let output = invoke(&[
         "query-bench",
